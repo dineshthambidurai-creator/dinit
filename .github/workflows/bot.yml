@@ -26,6 +26,18 @@ jobs:
     - name: Show current date/time (verify TZ)
       run: date
 
+    - name: Ensure we're inside IST window (09:15 - 15:30)
+      shell: bash
+      run: |
+        current=$(TZ=Asia/Kolkata date +%H:%M)
+        echo "Current IST time: $current"
+        start="09:15"
+        end="15:30"
+        if [[ "$current" < "$start" || "$current" > "$end" ]]; then
+          echo "Outside the desired window (09:15-15:30 IST). Exiting."
+          exit 0
+        fi
+
     - name: Setup Python
       uses: actions/setup-python@v5
       with:
