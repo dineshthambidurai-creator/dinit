@@ -20,7 +20,8 @@ simplejson>=3.19.2
 tenacity>=8.2.3
 
 pyotp>=2.9.0
-ta>=0.11.0
+ta
+
 
 
 
