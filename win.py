@@ -561,7 +561,7 @@ class DatabaseManager:
 class APIClient:
     """Handles API client initialization and data fetching."""
     
-    def __init__(self, credentials_path: str = "credentials.json"):
+    def __init__(self, credentials_path: Optional[str] = None):
         self.client: Optional[FivePaisaClient] = None
         self.credentials_path = credentials_path
         self._scrips_cache: Optional[pd.DataFrame] = None
@@ -569,12 +569,14 @@ class APIClient:
         self._daily_open_cache: Dict[str, bool] = {}
 
     def _load_credentials(self) -> dict:
-        # 1️⃣ Local file mode
-        if self.credentials_path:
+
+        # ✅ LOCAL FILE MODE
+        if self.credentials_path and os.path.exists(self.credentials_path):
             with open(self.credentials_path, "r") as f:
                 cred = json.load(f)
+
+        # ✅ ENV / GITHUB ACTIONS MODE
         else:
-            # 2️⃣ GitHub Actions / ENV mode
             cred = {
                 "CLIENT_CODE": os.getenv("CLIENT_CODE"),
                 "PIN": os.getenv("PIN"),
@@ -586,13 +588,13 @@ class APIClient:
                 "ENCRYPTION_KEY": os.getenv("ENCRYPTION_KEY"),
                 "USER_KEY": os.getenv("USER_KEY")
             }
-        # 3️⃣ Validate (VERY IMPORTANT)
-        for key, value in cred.items():
-            if not value:
-                raise RuntimeError(f"Missing 5Paisa credential: {key}")
+
+        # ✅ VALIDATION (MANDATORY)
+        missing = [k for k, v in cred.items() if not v]
+        if missing:
+            raise RuntimeError(f"Missing 5Paisa credentials: {missing}")
 
         return cred
-
     def initialize_client(self) -> bool:
         """Initialize 5Paisa client with TOTP authentication."""
         
