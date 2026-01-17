@@ -21,6 +21,7 @@ tenacity>=8.2.3
 
 pyotp>=2.9.0
 ta
+scipy
 
 
 
