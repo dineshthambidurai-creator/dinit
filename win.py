@@ -49,22 +49,30 @@ class SuppressPrints:
 
 class Logger:
     """Simple logging utility - Fixed encoding issues."""
-    
+    @staticmethod
+    def _log(level, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        print(f"{timestamp} | {level} | {message}", flush=True)
+        
     @staticmethod
     def info(message: str) -> None:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] INFO: {message}")
+        Logger._log("INFO", msg)
     
     @staticmethod
     def success(message: str) -> None:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] SUCCESS: {message}")
+        Logger._log("SUCCESS", msg)
     
     @staticmethod
     def error(message: str) -> None:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: {message}")
+        Logger._log("ERROR", msg)
     
     @staticmethod
     def warning(message: str) -> None:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: {message}")
+        Logger._log("WARNING", msg)
 
 # ===============================
 # CONFIGURATION
@@ -2561,6 +2569,7 @@ class SimplifiedTradingSystem:
                     time.sleep(CONFIG.DATA_UPDATE_INTERVAL)
                 else:
                     Logger.warning("Market is closed. Waiting for next trading session...")
+                    Logger.info("Heartbeat: bot running")
                     time.sleep(30)
         except KeyboardInterrupt:
             Logger.info("Trading system stopped by user")
@@ -3630,3 +3639,4 @@ def main():
 
 if __name__ == "__main__":
     exit(main())
+
