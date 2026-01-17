@@ -2,8 +2,9 @@ name: Bot
 
 on:
   schedule:
-    - cron: '0 4 * * 1-5'   # 9:30 AM IST (UTC 4:00)
-  workflow_dispatch:
+    - cron: '0 4 * * *'   # 09:30 IST
+    - cron: '0 10 * * *'  # 15:30 IST
+  workflow_dispatch: {}   # allow manual runs from Actions UI
 
 jobs:
   run-bot:
