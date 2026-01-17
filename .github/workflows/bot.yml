@@ -2,17 +2,29 @@ name: Bot
 
 on:
   schedule:
-    - cron: '0 4 * * *'   # 09:30 IST
-    - cron: '0 10 * * *'  # 15:30 IST
+    - cron: '45 3 * * *'   # 09:15 IST (UTC+5:30)
+    - cron: '0 10 * * *'  # 15:30 IST (UTC+5:30)
   workflow_dispatch: {}   # allow manual runs from Actions UI
+
+# Set TZ globally for the workflow (optional — also set on the job)
+env:
+  TZ: Asia/Kolkata
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Kolkata
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+
+    - name: Set timezone to IST (system)
+      run: sudo ln -sf /usr/share/zoneinfo/Asia/Kolkata /etc/localtime
+
+    - name: Show current date/time (verify TZ)
+      run: date
 
     - name: Setup Python
       uses: actions/setup-python@v5
@@ -25,14 +37,14 @@ jobs:
 
     - name: Run Trading Bot
       env:
-        "APP_NAME": ${{ secrets.APP_NAME }}
-        "APP_SOURCE": ${{ secrets.APP_SOURCE }}
-        "USER_ID": ${{ secrets.USER_ID }}
-        "PASSWORD": ${{ secrets.PASSWORD }}
-        "USER_KEY": ${{ secrets.USER_KEY }}
-        "ENCRYPTION_KEY": ${{ secrets.ENCRYPTION_KEY }}
-        "CLIENT_CODE": ${{ secrets.CLIENT_CODE }}
-        "PIN": ${{ secrets.PIN }}
-        "TOTP_SECRET": ${{ secrets.TOTP_SECRET }}
+        APP_NAME: ${{ secrets.APP_NAME }}
+        APP_SOURCE: ${{ secrets.APP_SOURCE }}
+        USER_ID: ${{ secrets.USER_ID }}
+        PASSWORD: ${{ secrets.PASSWORD }}
+        USER_KEY: ${{ secrets.USER_KEY }}
+        ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+        CLIENT_CODE: ${{ secrets.CLIENT_CODE }}
+        PIN: ${{ secrets.PIN }}
+        TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
       run: |
         python win.py
