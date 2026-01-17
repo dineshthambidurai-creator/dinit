@@ -57,22 +57,22 @@ class Logger:
     @staticmethod
     def info(message: str) -> None:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] INFO: {message}")
-        Logger._log("INFO", msg)
+        Logger._log("INFO", message)
     
     @staticmethod
     def success(message: str) -> None:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] SUCCESS: {message}")
-        Logger._log("SUCCESS", msg)
+        Logger._log("SUCCESS", message)
     
     @staticmethod
     def error(message: str) -> None:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: {message}")
-        Logger._log("ERROR", msg)
+        Logger._log("ERROR", message)
     
     @staticmethod
     def warning(message: str) -> None:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: {message}")
-        Logger._log("WARNING", msg)
+        Logger._log("WARNING", message)
 
 # ===============================
 # CONFIGURATION
@@ -3639,4 +3639,5 @@ def main():
 
 if __name__ == "__main__":
     exit(main())
+
 
