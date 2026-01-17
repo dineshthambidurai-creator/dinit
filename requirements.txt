@@ -1,35 +1,23 @@
 py5paisa
 matplotlib
 mplfinance
-# Core HTTP & API
 requests>=2.31.0
 urllib3>=2.0.7
 
-# Data handling
 pandas>=2.0.3
 numpy>=1.24.4
 
-# Date & Time
 python-dateutil>=2.8.2
 pytz>=2023.3
 
-# Scheduling / looping
 schedule>=1.2.1
-
-# WebSocket (if used by 5Paisa)
 websocket-client>=1.6.3
 
-# Tables / console output (optional but common)
 tabulate>=0.9.0
-
-# Environment variables (recommended)
 python-dotenv>=1.0.0
-
-# Logging helpers
 colorama>=0.4.6
-
-# JSON handling (safe pin)
 simplejson>=3.19.2
-
-# Retry / robustness
 tenacity>=8.2.3
+
+pyotp>=2.9.0
+
