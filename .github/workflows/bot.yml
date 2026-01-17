@@ -1,0 +1,37 @@
+name: Bot
+
+on:
+  schedule:
+    - cron: '0 4 * * 1-5'   # 9:30 AM IST (UTC 4:00)
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Run Trading Bot
+      env:
+        "APP_NAME": ${{ secrets.APP_NAME }}
+        "APP_SOURCE": ${{ secrets.APP_SOURCE }}
+        "USER_ID": ${{ secrets.USER_ID }}
+        "PASSWORD": ${{ secrets.PASSWORD }}
+        "USER_KEY": ${{ secrets.USER_KEY }}
+        "ENCRYPTION_KEY": ${{ secrets.ENCRYPTION_KEY }}
+        "CLIENT_CODE": ${{ secrets.CLIENT_CODE }}
+        "PIN": ${{ secrets.PIN }}
+        "TOTP_SECRET": ${{ secrets.TOTP_SECRET }}
+      run: |
+        python win.py
