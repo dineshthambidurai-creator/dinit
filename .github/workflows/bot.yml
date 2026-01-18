@@ -1,42 +1,29 @@
-name: Bot
+name: Bot (Weekdays)
 
 on:
   schedule:
-    - cron: '45 3 * * *'   # 09:15 IST (UTC+5:30)
-    - cron: '0 10 * * *'  # 15:30 IST (UTC+5:30)
-  workflow_dispatch: {}   # allow manual runs from Actions UI
+    # 09:15 IST → 03:45 UTC (Mon–Fri)
+    - cron: '45 3 * * 1-5'
 
-# Set TZ globally for the workflow (optional — also set on the job)
+  workflow_dispatch: {}
+
 env:
   TZ: Asia/Kolkata
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    env:
-      TZ: Asia/Kolkata
+    timeout-minutes: 390   # 6.5 hours safety
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set timezone to IST (system)
+    - name: Set timezone to IST
       run: sudo ln -sf /usr/share/zoneinfo/Asia/Kolkata /etc/localtime
 
-    - name: Show current date/time (verify TZ)
+    - name: Show IST time
       run: date
-
-    - name: Ensure we're inside IST window (09:15 - 15:30)
-      shell: bash
-      run: |
-        current=$(TZ=Asia/Kolkata date +%H:%M)
-        echo "Current IST time: $current"
-        start="09:15"
-        end="15:30"
-        if [[ "$current" < "$start" || "$current" > "$end" ]]; then
-          echo "Outside the desired window (09:15-15:30 IST). Exiting."
-          exit 0
-        fi
 
     - name: Setup Python
       uses: actions/setup-python@v5
@@ -44,10 +31,9 @@ jobs:
         python-version: '3.10'
 
     - name: Install dependencies
-      run: |
-        pip install -r requirements.txt
+      run: pip install -r requirements.txt
 
-    - name: Run Trading Bot
+    - name: Run Trading Bot (09:15–15:30 IST)
       env:
         APP_NAME: ${{ secrets.APP_NAME }}
         APP_SOURCE: ${{ secrets.APP_SOURCE }}
@@ -58,5 +44,4 @@ jobs:
         CLIENT_CODE: ${{ secrets.CLIENT_CODE }}
         PIN: ${{ secrets.PIN }}
         TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
-      run: |
-        python win.py
+      run: python win.py
