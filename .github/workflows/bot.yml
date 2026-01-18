@@ -3,7 +3,7 @@ name: Bot (Weekdays)
 on:
   schedule:
     # 09:15 IST → 03:45 UTC (Mon–Fri)
-    - cron: '45 3 * * 1-5'
+    - cron: '51 3 * * *'
 
   workflow_dispatch: {}
 
