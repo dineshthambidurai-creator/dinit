@@ -49,22 +49,26 @@ class SuppressPrints:
 
 class Logger:
     """Simple logging utility - Fixed encoding issues."""
-    
+    @staticmethod
+    def _log(level, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        print(f"{timestamp} | {level} | {message}", flush=True)
+        
     @staticmethod
     def info(message: str) -> None:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] INFO: {message}")
+        Logger._log("INFO", message)
     
     @staticmethod
     def success(message: str) -> None:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] SUCCESS: {message}")
+        Logger._log("SUCCESS", message)
     
     @staticmethod
     def error(message: str) -> None:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: {message}")
+        Logger._log("ERROR", message)
     
     @staticmethod
     def warning(message: str) -> None:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: {message}")
+        Logger._log("WARNING", message)
 
 # ===============================
 # CONFIGURATION
