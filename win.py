@@ -49,26 +49,22 @@ class SuppressPrints:
 
 class Logger:
     """Simple logging utility - Fixed encoding issues."""
-    @staticmethod
-    def _log(level, message):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        print(f"{timestamp} | {level} | {message}", flush=True)
-        
+    
     @staticmethod
     def info(message: str) -> None:
-        Logger._log("INFO", message)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] INFO: {message}")
     
     @staticmethod
     def success(message: str) -> None:
-        Logger._log("SUCCESS", message)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] SUCCESS: {message}")
     
     @staticmethod
     def error(message: str) -> None:
-        Logger._log("ERROR", message)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: {message}")
     
     @staticmethod
     def warning(message: str) -> None:
-        Logger._log("WARNING", message)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: {message}")
 
 # ===============================
 # CONFIGURATION
@@ -2886,6 +2882,17 @@ class SimplifiedTradingSystem:
                     continue
 
                 exit_now = False
+                exit_reason = None
+
+                def get_exit_price(option_type, token, strike):
+                    for opt in option_chain:
+                        if opt.get("option_type") == option_type and (
+                            opt.get("ScripCode") == token or opt.get("strike_price") == strike
+                        ):
+                            return float(opt.get("last_price", 0))
+                    return 0.0
+                
+
 
                 # ---------- S1 (PCR-OI) ----------
                 if sid == "S1":
@@ -2921,23 +2928,27 @@ class SimplifiedTradingSystem:
                         )
                 # ---------- S5 (OI SENTIMENT CHANGE) ----------
                 elif sid == "S5":
-                    if opt_type == "CE":
-                        # Exit CE when OI sentiment turns bearish
-                        exit_now = oi_sentiment == "BEARISH"
-                    else:
-                        # Exit PE when OI sentiment turns bullish
-                        exit_now = oi_sentiment == "BULLISH"
-
-                def get_exit_price(option_type, token, strike):
-                    for opt in option_chain:
-                        if opt.get("option_type") == option_type and (
-                            opt.get("ScripCode") == token or opt.get("strike_price") == strike
-                        ):
-                            return float(opt.get("last_price", 0))
-                    return 0.0
-                
-                if exit_now or self.api_client.is_force_exit_time():
                     exit_price = get_exit_price(opt_type, trade["token"], trade["strike"])
+                
+                    sl_price = trade["entry_price"] * 0.70   # 30% SL
+                    tgt_price = trade["entry_price"] * 1.30  # 30% TARGET
+
+                    if opt_type == "CE":
+                        # Exit CE only when OI is BEARISH AND (SL or TARGET)
+                        exit_now = (
+                            oi_sentiment == "BEARISH" and
+                            (exit_price <= sl_price or exit_price >= tgt_price)
+                        )
+                    else:
+                        # Exit PE only when OI is BULLISH AND (SL or TARGET)
+                        exit_now = (
+                            oi_sentiment == "BULLISH" and
+                            (exit_price <= sl_price or exit_price >= tgt_price)
+                        )                
+
+
+                if exit_now or self.api_client.is_force_exit_time():
+                    
                     # ==================================================
                     # 🟥 PLACE LIVE SELL ORDER (THIS IS YOUR REQUEST)sss
                     # ==================================================
@@ -3634,6 +3645,3 @@ def main():
 
 if __name__ == "__main__":
     exit(main())
-
-
-
