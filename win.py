@@ -2897,7 +2897,8 @@ class SimplifiedTradingSystem:
                     return 0.0
                 
 
-
+                
+                exit_price = get_exit_price(opt_type, trade["token"], trade["strike"])
                 # ---------- S1 (PCR-OI) ----------
                 if sid == "S1":
                     if opt_type == "CE":
@@ -2931,9 +2932,7 @@ class SimplifiedTradingSystem:
                             ema9 > ema21
                         )
                 # ---------- S5 (OI SENTIMENT CHANGE) ----------
-                elif sid == "S5":
-                    exit_price = get_exit_price(opt_type, trade["token"], trade["strike"])
-                
+                elif sid == "S5":                
                     sl_price = trade["entry_price"] * 0.70   # 30% SL
                     tgt_price = trade["entry_price"] * 1.30  # 30% TARGET
 
@@ -3649,3 +3648,4 @@ def main():
 
 if __name__ == "__main__":
     exit(main())
+
