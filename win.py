@@ -91,8 +91,8 @@ class TradingConfig:
         
         if self.SYMBOLS is None:
             # self.SYMBOLS = ['NIFTY']
-            # self.SYMBOLS = ['NIFTY', 'BANKNIFTY', 'FINNIFTY',  'MIDCPNIFTY', 'SENSEX']
-            self.SYMBOLS = ['NIFTY', 'BANKNIFTY']
+            self.SYMBOLS = ['NIFTY', 'BANKNIFTY', 'FINNIFTY',  'MIDCPNIFTY', 'SENSEX']
+            # self.SYMBOLS = ['NIFTY', 'BANKNIFTY']
 
         
         if self.STRIKE_STEPS is None:
@@ -668,24 +668,63 @@ class APIClient:
             
         return None
     
-    def find_scrip_info(self, symbol: str) -> Optional[pd.Series]:
-        """Find scrip information for a given symbol."""
+    def find_scrip_info(self, symbol: Union[str, int]) -> Optional[pd.Series]:
+
         scrips_df = self.load_scrips_data()
-        if scrips_df is None or scrips_df.empty:
+
+        if scrips_df is None:
+            Logger.error("❌ Scrips data is None (API/cache issue)")
             return None
-        
-        # Direct match strategy
-        for exch in ['N', 'B']:  # NSE
-            for exch_type in ['I', 'C', 'D']:  # Index, Cash, Derivatives
-                direct_match = scrips_df[
-                    (scrips_df['Name'].str.upper() == symbol.upper()) &
+
+        if scrips_df.empty:
+            Logger.error("❌ Scrips DataFrame is empty")
+            return None
+
+          # ✅ IMPORTANT FIX: normalize ScripCode column to string
+        scrips_df['ScripCode'] = scrips_df['ScripCode'].astype(str)
+
+        # ===============================
+        # CASE 1: Numeric → ScripCode lookup
+        # ===============================
+        if isinstance(symbol, int) or str(symbol).isdigit():
+            scrip_code = str(symbol)
+
+            match = scrips_df[scrips_df['ScripCode'] == scrip_code]
+
+            if not match.empty:
+                return match.iloc[0]
+            else:
+                Logger.warning(f"⚠️ No match found for ScripCode: {scrip_code}")
+
+        # ===============================
+        # CASE 2: Symbol lookup
+        # ===============================
+        symbol_upper = str(symbol).upper()
+
+        for exch in ['N', 'B']:
+            for exch_type in ['I', 'C', 'D']:
+                match = scrips_df[
+                    (scrips_df['Name'].str.upper() == symbol_upper) &
                     (scrips_df['Exch'] == exch) &
                     (scrips_df['ExchType'] == exch_type)
                 ]
-                
-                if not direct_match.empty:
-                    return direct_match.iloc[0]
-        
+
+                if not match.empty:
+                    return match.iloc[0]
+
+        # ===============================
+        # FINAL FAIL
+        # ===============================
+        Logger.error(f"❌ Scrip info not found for: {symbol}")
+
+        # 🔥 DEBUG: show similar names (VERY useful)
+        similar = scrips_df[
+            scrips_df['Name'].str.contains(symbol_upper[:4], case=False, na=False)
+        ]['Name'].unique()[:5]
+
+        if len(similar) > 0:
+            Logger.info(f"🔁 Similar symbols found: {list(similar)}")
+
         return None
     
 
@@ -2665,24 +2704,26 @@ class SimplifiedTradingSystem:
             option_chain
         )
 
+        
     def display_enhanced_analysis_latest(
-        self,
-        symbol,
-        current_price,
-        nearest_call,
-        nearest_put,
-        current_data,
-        option_analysis,
-        oc_supports,
-        oc_resistances,
-        market_bias,
-        validated_supports,
-        validated_resistances,
-        hist_df,
-        option_chain
+            self,
+            symbol,
+            current_price,
+            nearest_call,
+            nearest_put,
+            current_data,
+            option_analysis,
+            oc_supports,
+            oc_resistances,
+            market_bias,
+            validated_supports,
+            validated_resistances,
+            hist_df,
+            option_chain
     ):
+
         # ==================================================
-        # STEP 1️⃣ MARKET CONTEXT
+        # STEP 1 MARKET CONTEXT
         # ==================================================
         last = hist_df.iloc[-1]
         ema9 = round(last.get("EMA_9", 0), 2)
@@ -2692,25 +2733,14 @@ class SimplifiedTradingSystem:
         delta_bias = option_analysis.get("delta_bias_score", 50)
         pcr_oi = option_analysis.get("pcr_oi", 1.0)
 
-        print(f"\n{'=' * 80}")
+        print(f"\n{'='*80}")
         print(f"MARKET ANALYSIS: {symbol}")
-        print(f"{'=' * 80}")
-        print(f"Price: Rs.{current_price:.2f}")
-        print(
-            f"O:{current_data.get('open',0):.2f} | "
-            f"H:{current_data.get('high',0):.2f} | "
-            f"L:{current_data.get('low',0):.2f} | "
-            f"Vol:{current_data.get('volume',0):,}"
-        )
-        # print(f"EMA9: {ema9} | EMA21: {ema21}")
-        # print(f"Delta Bias: {delta_bias} | PCR-OI: {pcr_oi}")
- 
+        print(f"{'='*80}")
+        print(f"Price: Rs.{current_price:.2f} | EMA9: {ema9} | EMA21: {ema21}")
 
         # ==================================================
-        # STEP 2️⃣ STATE INIT
+        # STEP 2 STATE INIT
         # ==================================================
-        ALLOWED_S5_SYMBOLS = {"NIFTY"}
-
         if symbol not in CONFIG.oi_state:
             CONFIG.oi_state[symbol] = {
                 "bullish": False,
@@ -2719,14 +2749,14 @@ class SimplifiedTradingSystem:
                 "bearish_level": None,
                 "trades": {
                     s: {"CE": new_trade_state(), "PE": new_trade_state()}
-                    for s in ["S1", "S2", "S3", "S4", "S5"]
+                    for s in ["S1", "S2", "S3", "S4", "S5", "S6"]
                 }
             }
 
         state = CONFIG.oi_state[symbol]
 
         # ==================================================
-        # STEP 3️⃣ PRICE CONFIRMATION
+        # STEP 3 PRICE CONFIRMATION
         # ==================================================
         candle_low = current_data["low"]
         candle_high = current_data["high"]
@@ -2735,7 +2765,6 @@ class SimplifiedTradingSystem:
 
         supports = {x for s in validated_supports for x in s.get("historical_matches", [])}
         resistances = {x for r in validated_resistances for x in r.get("historical_matches", [])}
-       
 
         for lvl in supports:
             if candle_low < lvl < current_price:
@@ -2746,38 +2775,92 @@ class SimplifiedTradingSystem:
             if candle_high > lvl > current_price:
                 state["bearish"] = True
                 state["bearish_level"] = lvl
-        # print(resistances)
+
         # ==================================================
-        # STEP 4️⃣ STRATEGY ENTRY CONDITIONS
+        # STEP 4 ZONE LOGIC (NEW 🔥)
+        # ==================================================
+        range_val = candle_high - candle_low
+        zone = range_val * 0.25
+
+        ce_zone_start = candle_high - zone
+        pe_zone_end = candle_low + zone
+
+        ce_zone_condition = ce_zone_start <= current_price <= candle_high
+        pe_zone_condition = candle_low <= current_price <= pe_zone_end
+
+        # ==================================================
+        # STEP 5 STRATEGIES
         # ==================================================
         strategies = {
-            "S1": lambda: True,
-            "S2": lambda: delta_bias > 50,
-            "S3": lambda: ema9 > ema21,
-            "S4": lambda: (
-                state["bullish"] and
-                delta_bias > 50 and
-                ema9 > ema21
-            ),            
-            "S5": lambda: True
+
+            "S1": lambda d: (
+                (d == "CE" and ema9 > ema21) or
+                (d == "PE" and ema9 < ema21)
+            ),
+
+            "S2": lambda d: (
+                (d == "CE" and ema9 > ema21) or
+                (d == "PE" and ema9 < ema21)
+            ),
+
+            "S3": lambda d: True,
+
+            "S4": lambda d: (
+                ((d == "CE" and ce_zone_condition) or (d == "PE" and pe_zone_condition)) and
+                ((d == "CE" and ema9 > ema21) or (d == "PE" and ema9 < ema21))
+            ),
+
+            "S5": lambda d: (
+                ((d == "CE" and ce_zone_condition) or (d == "PE" and pe_zone_condition)) and
+                ((d == "CE" and ema9 > ema21) or (d == "PE" and ema9 < ema21))
+            ),
+
+            "S6": lambda d: (
+                (d == "CE" and ce_zone_condition) or
+                (d == "PE" and pe_zone_condition)
+            )
         }
 
         # ==================================================
-        # STEP 5️⃣ ENTRY (ORDERS + DB)
+        # OPTION EMA
+        # ==================================================
+        def get_option_ema(option_name):
+            df = self.api_client.fetch_historical_data(option_name, mins="5m", days_back=5)
+            df = TechnicalIndicators.compute_all_indicators(df)
+            last = df.iloc[-1]
+
+            return (
+                round(last.get("EMA_9", 0), 2),
+                round(last.get("EMA_21", 0), 2)
+            )
+
+        def check_option_ema(direction, emaOp9, emaOp21):
+            return emaOp9 > emaOp21 if direction == "CE" else emaOp9 < emaOp21
+
+        def get_token(opt):
+            return opt.get("ScripCode") or opt.get("scripCode") or opt.get("token")
+
+        # ==================================================
+        # STEP 6 ENTRY
         # ==================================================
         for sid, cond in strategies.items():
 
-            # ---------- CE ENTRY ----------
             ce = state["trades"][sid]["CE"]
+
             if (
                 not ce["active"]
                 and nearest_call
                 and oi_sentiment == "BULLISH"
                 and state["bullish"]
-                and cond()
-                and state["bullish_level"] != ce["last_used_level"]
+                and cond("CE")
                 and self.api_client.is_live_entry_time()
             ):
+
+                if sid in ["S1", "S3", "S4", "S6"]:
+                    emaOp9, emaOp21 = get_option_ema(nearest_call["name"])
+                    if not check_option_ema("CE", emaOp9, emaOp21):
+                        continue
+
                 qty = CONFIG.LOT_SIZES[symbol.upper()] * CONFIG.number_of_lots
                 price = nearest_call["last_price"]
 
@@ -2786,56 +2869,32 @@ class SimplifiedTradingSystem:
                     strategy=sid,
                     option_type="CE",
                     strike=nearest_call["strike_price"],
-                    token=nearest_call["scripCode"],
+                    token=get_token(nearest_call),
                     qty=qty,
                     entry_price=price,
                     entry_oi=oi_sentiment,
                     entry_delta=delta_bias
                 )
 
-                ce.update({
-                    "active": True,
-                    "trade_id": trade_id,
-                    "strike": nearest_call["strike_price"],
-                    "token": nearest_call["scripCode"],
-                    "entry_price": price,
-                    "qty": qty,
-                    "entry_oi": oi_sentiment,
-                    "entry_delta": delta_bias,
-                    "entry_pcr_oi": pcr_oi,
-                    "last_used_level": state["bullish_level"]
-                })
+                ce.update({"active": True, "trade_id": trade_id})
+                print(f"✅ {sid} CE ENTRY")
 
-                if sid == "S5" and symbol.upper() in ALLOWED_S5_SYMBOLS:
-                    self.api_client.place_order_api(
-                        scripCode=ce["token"],
-                        direction="BUY",
-                        quantity=qty,
-                        price=price,
-                        strike_price=ce["strike"],
-                        option_type="CE",
-                        exchange=current_data.get("Exch", "N")
-                    )
-
-            # ---------- PE ENTRY ----------
             pe = state["trades"][sid]["PE"]
-            bearish_ok = (
-                sid == "S1" or
-                (sid == "S2" and delta_bias < 50) or
-                (sid == "S3" and ema9 < ema21) or
-                (sid == "S4" and state["bearish"] and delta_bias < 50 and ema9 < ema21) or
-                sid == "S5"
-            )
 
             if (
                 not pe["active"]
                 and nearest_put
                 and oi_sentiment == "BEARISH"
                 and state["bearish"]
-                and bearish_ok
-                and state["bearish_level"] != pe["last_used_level"]
+                and cond("PE")
                 and self.api_client.is_live_entry_time()
             ):
+
+                if sid in ["S1", "S3", "S4", "S6"]:
+                    emaOp9, emaOp21 = get_option_ema(nearest_put["name"])
+                    if not check_option_ema("PE", emaOp9, emaOp21):
+                        continue
+
                 qty = CONFIG.LOT_SIZES[symbol.upper()] * CONFIG.number_of_lots
                 price = nearest_put["last_price"]
 
@@ -2844,49 +2903,27 @@ class SimplifiedTradingSystem:
                     strategy=sid,
                     option_type="PE",
                     strike=nearest_put["strike_price"],
-                    token=nearest_put["scripCode"],
+                    token=get_token(nearest_put),
                     qty=qty,
                     entry_price=price,
                     entry_oi=oi_sentiment,
                     entry_delta=delta_bias
                 )
 
-                pe.update({
-                    "active": True,
-                    "trade_id": trade_id,
-                    "strike": nearest_put["strike_price"],
-                    "token": nearest_put["scripCode"],
-                    "entry_price": price,
-                    "qty": qty,  
-                    "entry_oi": oi_sentiment,
-                    "entry_delta": delta_bias,
-                    "entry_pcr_oi": pcr_oi,
-                    "last_used_level": state["bearish_level"]
-                })
-
-
-                if sid == "S5" and symbol.upper() in ALLOWED_S5_SYMBOLS:
-                    self.api_client.place_order_api(
-                        scripCode=pe["token"],
-                        direction="BUY",
-                        quantity=qty,
-                        price=price,
-                        strike_price=pe["strike"],
-                        option_type="PE",
-                        exchange=current_data.get("Exch", "N")
-                    )
+                pe.update({"active": True, "trade_id": trade_id})
+                print(f"✅ {sid} PE ENTRY")
 
         # ==================================================
-        # STEP 6️⃣ EXIT + P&L
+        # STEP 7 EXIT
         # ==================================================
         for sid, sides in state["trades"].items():
+
             for opt_type, trade in sides.items():
 
                 if not trade["active"]:
                     continue
 
                 exit_now = False
-                exit_reason = None
 
                 def get_exit_price(option_type, token, strike):
                     for opt in option_chain:
@@ -2894,734 +2931,52 @@ class SimplifiedTradingSystem:
                             opt.get("ScripCode") == token or opt.get("strike_price") == strike
                         ):
                             return float(opt.get("last_price", 0))
-                    return 0.0
-                
+                    return 0
 
-                
-                exit_price = get_exit_price(opt_type, trade["token"], trade["strike"])
-                # ---------- S1 (PCR-OI) ----------
-                if sid == "S1":
-                    if opt_type == "CE":
-                        exit_now = pcr_oi < trade["entry_pcr_oi"]
-                    else:
-                        exit_now = pcr_oi > trade["entry_pcr_oi"]
+                exit_price = get_exit_price(opt_type, trade.get("token"), trade.get("strike"))
 
-                # ---------- S2 (DELTA) ----------
-                elif sid == "S2":
-                    if opt_type == "CE":
-                        exit_now = delta_bias <= trade["entry_delta"] - 5
-                    else:
-                        exit_now = delta_bias >= trade["entry_delta"] + 5
+                emaOp9, emaOp21 = get_option_ema(trade.get("token"))
 
-                # ---------- S3 (EMA CROSS) ----------
-                elif sid == "S3":
+                # S2 → Index EMA
+                if sid == "S2":
                     exit_now = ema9 < ema21 if opt_type == "CE" else ema9 > ema21
 
-                # ---------- S4 (TRUE COMBINED AND EXIT) ----------
-                elif sid == "S4":
-                    if opt_type == "CE":
-                        exit_now = (
-                            pcr_oi < trade["entry_pcr_oi"] and
-                            delta_bias <= trade["entry_delta"] - 5 and
-                            ema9 < ema21
-                        )
-                    else:
-                        exit_now = (
-                            pcr_oi > trade["entry_pcr_oi"] and
-                            delta_bias >= trade["entry_delta"] + 5 and
-                            ema9 > ema21
-                        )
-                # ---------- S5 (OI SENTIMENT CHANGE) ----------
-                elif sid == "S5":                
-                    sl_price = trade["entry_price"] * 0.70   # 30% SL
-                    tgt_price = trade["entry_price"] * 1.30  # 30% TARGET
+                # S3 → Option EMA
+                elif sid == "S3":
+                    exit_now = emaOp9 < emaOp21 if opt_type == "CE" else emaOp9 > emaOp21
 
+                # S1 / S4 → Combined
+                elif sid in ["S1", "S4"]:
                     if opt_type == "CE":
-                        # Exit CE only when OI is BEARISH AND (SL or TARGET)
-                        exit_now = (
-                            oi_sentiment == "BEARISH" and
-                            (exit_price <= sl_price or exit_price >= tgt_price)
-                        )
+                        exit_now = (ema9 < ema21) and (emaOp9 < emaOp21)
                     else:
-                        # Exit PE only when OI is BULLISH AND (SL or TARGET)
-                        exit_now = (
-                            oi_sentiment == "BULLISH" and
-                            (exit_price <= sl_price or exit_price >= tgt_price)
-                        )                
+                        exit_now = (ema9 > ema21) and (emaOp9 > emaOp21)
 
+                # S5 → Index EMA
+                elif sid == "S5":
+                    exit_now = ema9 < ema21 if opt_type == "CE" else ema9 > ema21
+
+                # S6 → Option EMA
+                elif sid == "S6":
+                    exit_now = emaOp9 < emaOp21 if opt_type == "CE" else emaOp9 > emaOp21
 
                 if exit_now or self.api_client.is_force_exit_time():
-                    
-                    # ==================================================
-                    # 🟥 PLACE LIVE SELL ORDER (THIS IS YOUR REQUEST)sss
-                    # ==================================================
-                    if sid == "S5" and symbol.upper() in ALLOWED_S5_SYMBOLS:
-                        self.api_client.place_order_api(
-                            scripCode=trade["token"],
-                            direction="SELL",
-                            quantity=trade["qty"],
-                            price=0,
-                            strike_price=trade["strike"],
-                            option_type=opt_type,
-                            exchange=current_data.get("Exch", "N")
-                        )
-
 
                     if exit_price <= 0:
-                        print(
-                            f"[WARN] Exit price not found | "
-                            f"Symbol: {symbol} | Strategy: {sid} | Token: {trade['token']}"
-                        )
                         continue
 
-
                     pnl = (exit_price - trade["entry_price"]) * trade["qty"]
-                    self.db_manager.close_trade(trade["trade_id"], exit_price, pnl)
+
+                    self.db_manager.close_trade(
+                        trade["trade_id"],
+                        exit_price,
+                        pnl
+                    )
+
+                    print(f"❌ {sid} EXIT | PnL: {pnl}")
+
                     trade.update(new_trade_state())
-
-
-    
-    # def display_enhanced_analysis_latest(
-    # self,
-    # symbol: str,
-    # current_price: float,
-    # nearest_call: Dict[str, float],
-    # nearest_put: Dict[str, float],
-    # current_data: Dict,
-    # option_analysis: Dict,
-    # oc_supports: list,
-    # oc_resistances: list,
-    # market_bias: str,
-    # validated_supports: list,
-    # validated_resistances: list,
-    # hist_df: pd.DataFrame
-    # ):
-    #     def get_exit_price(option_type, token, strike):
-    #         options = option_analysis.get("option_chain", [])
-    #         for opt in options:
-    #             if opt.get("option_type") == option_type and (
-    #                 opt.get("token") == token or opt.get("strike_price") == strike
-    #             ):
-    #                 return opt.get("last_price", 0)
-    #         return 0
-
-
-    #     last = hist_df.iloc[-1]
-
-    #     tech = {
-    #         "ema_9": round(last.get("EMA_9", 0), 2),
-    #         "ema_21": round(last.get("EMA_21", 0), 2),
-    #         "vwap": round(last.get("VWAP", 0), 2),
-    #         "rsi": round(last.get("RSI", 0), 2),
-    #         "macd_hist": round(last.get("MACD", 0), 2),
-    #         "atr": round(last.get("ATR", 0), 2),
-    #     }
-
-    #     print(f"\n{'='*80}")
-    #     print(f"MARKET ANALYSIS: {symbol}")
-    #     print(f"{'='*80}")
-
-    #     print(f"Price: Rs.{current_price:.2f}")
-    #     print(
-    #         f"O: {current_data.get('open', 0):.2f} | "
-    #         f"H: {current_data.get('high', 0):.2f} | "
-    #         f"L: {current_data.get('low', 0):.2f} | "
-    #         f"Vol: {current_data.get('volume', 0):,}"
-    #     )
-
-    #     print(
-    #         f"Nearest CALL: {nearest_call['strike_price']} @ {nearest_call['last_price']}"
-    #         if nearest_call else "Nearest CALL: N/A"
-    #     )
-    #     print(
-    #         f"Nearest PUT : {nearest_put['strike_price']} @ {nearest_put['last_price']}"
-    #         if nearest_put else "Nearest PUT : N/A"
-    #     )
-
-    #     print(
-    #         f"EMA9: {tech.get('ema_9', 'NA')} | "
-    #         f"EMA21: {tech.get('ema_21', 'NA')}"
-    #     )
-
-    #     candle_high = current_data.get("high", 0)
-    #     candle_low = current_data.get("low", 0)
-    #     candle_close = current_price
-
-    #     oi_sentiment = option_analysis.get("oi_sentiment")
-    #     delta_bias = option_analysis.get("delta_bias_score", 50)
-    #     oi_exit_price_new = None
-
-    #     # ==================================================
-    #     # INIT OI STATE
-    #     # ==================================================
-    #     if symbol not in CONFIG.oi_state:
-    #         CONFIG.oi_state[symbol] = {
-    #             "CE": {
-    #                 "active": False,
-    #                 "strike": None,
-    #                 "token": None,
-    #                 "entry_price": None,
-    #                 "last_used_level": None
-    #             },
-    #             "PE": {
-    #                 "active": False,
-    #                 "strike": None,
-    #                 "token": None,
-    #                 "entry_price": None,
-    #                 "last_used_level": None
-    #             },
-    #             "bullish_price_confirmed": False,
-    #             "bullish_crossed_level": None,
-    #             "bearish_price_confirmed": False,
-    #             "bearish_crossed_level": None
-    #         }
-
-    #     state = CONFIG.oi_state[symbol]
-
-    #     # ==================================================
-    #     # 🟢 BULLISH PRICE CONFIRMATION → CE
-    #     # ==================================================
-    #     state["bullish_price_confirmed"] = False
-    #     state["bullish_crossed_level"] = None
-
-    #     hist_support_levels = []
-    #     for sup in validated_supports:
-    #         hist_support_levels.extend(sup.get("historical_matches", []))
-    #     hist_support_levels = list(set(hist_support_levels))
-
-    #     if hist_support_levels:
-    #         crossed = [lvl for lvl in hist_support_levels if candle_low < lvl]
-    #         if crossed:
-    #             level = max(crossed)
-    #             if candle_close > level:
-    #                 state["bullish_price_confirmed"] = True
-    #                 state["bullish_crossed_level"] = level
-
-    #     # ==================================================
-    #     # 🔴 BEARISH PRICE CONFIRMATION → PE
-    #     # ==================================================
-    #     state["bearish_price_confirmed"] = False
-    #     state["bearish_crossed_level"] = None
-
-    #     hist_resistance_levels = []
-    #     for res in validated_resistances:
-    #         hist_resistance_levels.extend(res.get("historical_matches", []))
-    #     hist_resistance_levels = list(set(hist_resistance_levels))
-
-    #     if hist_resistance_levels:
-    #         crossed = [lvl for lvl in hist_resistance_levels if candle_high > lvl]
-    #         if crossed:
-    #             level = min(crossed)
-    #             if candle_close < level:
-    #                 state["bearish_price_confirmed"] = True
-    #                 state["bearish_crossed_level"] = level
-
-    #     ce_state = state["CE"]
-    #     pe_state = state["PE"]
-
-    #     # ==================================================
-    #     # 🟢 CE ENTRY (BULLISH ONLY)
-    #     # ==================================================
-    #     if (
-    #         not ce_state["active"] and
-    #         oi_sentiment == "BULLISH" and
-    #         state["bullish_price_confirmed"] and
-    #         nearest_call and
-    #         state["bullish_crossed_level"] != ce_state["last_used_level"]
-    #     ):
-    #         ce_state["active"] = True
-    #         ce_state["strike"] = nearest_call["strike_price"]
-    #         ce_state["token"] = nearest_call.get("token") or nearest_call["scripCode"]
-    #         ce_state["entry_price"] = nearest_call["last_price"]
-    #         ce_state["last_used_level"] = state["bullish_crossed_level"]
-
-    #         print(f"🟢 BUY CE | {symbol} | {ce_state['strike']} @ {ce_state['entry_price']}")
-
-    #         qty = CONFIG.LOT_SIZES[symbol.upper()] * CONFIG.number_of_lots
-    #         self.api_client.place_order_api(
-    #             scripCode=nearest_call["scripCode"],
-    #             direction="BUY",
-    #             quantity=qty,
-    #             price=ce_state["entry_price"],
-    #             strike_price=ce_state["strike"],
-    #             option_type="CE"
-    #         )
-
-    #     # ==================================================
-    #     # 🔴 PE ENTRY (BEARISH ONLY)
-    #     # ==================================================
-    #     if (
-    #         not pe_state["active"] and
-    #         oi_sentiment == "BEARISH" and
-    #         state["bearish_price_confirmed"] and
-    #         nearest_put and
-    #         state["bearish_crossed_level"] != pe_state["last_used_level"]
-    #     ):
-    #         pe_state["active"] = True
-    #         pe_state["strike"] = nearest_put["strike_price"]
-    #         pe_state["token"] = nearest_put.get("token") or nearest_put["scripCode"]
-    #         pe_state["entry_price"] = nearest_put["last_price"]
-    #         pe_state["last_used_level"] = state["bearish_crossed_level"]
-
-    #         print(f"🔴 BUY PE | {symbol} | {pe_state['strike']} @ {pe_state['entry_price']}")
-
-    #         qty = CONFIG.LOT_SIZES[symbol.upper()] * CONFIG.number_of_lots
-    #         self.api_client.place_order_api(
-    #             scripCode=nearest_put["scripCode"],
-    #             direction="BUY",
-    #             quantity=qty,
-    #             price=pe_state["entry_price"],
-    #             strike_price=pe_state["strike"],
-    #             option_type="PE"
-    #         )
-
-    #     # ==================================================
-    #     # ❌ EXIT LOGIC
-    #     # ==================================================
-    #     if ce_state["active"] and oi_sentiment == "BEARISH":
-    #         oi_exit_price_new = get_exit_price("CE", ce_state["token"], ce_state["strike"])
-    #         print(f"❌ SELL CE | {symbol} | {ce_state['strike']} @ {oi_exit_price_new}")
-    #         ce_state.update({"active": False, "strike": None, "token": None, "entry_price": None})
-
-
-    #     if pe_state["active"] and oi_sentiment == "BULLISH":
-    #         oi_exit_price_new = get_exit_price("PE", pe_state["token"], pe_state["strike"])
-    #         print(f"❌ SELL PE | {symbol} | {pe_state['strike']} @ {oi_exit_price_new}")
-    #         pe_state.update({"active": False, "strike": None, "token": None, "entry_price": None})
-
-
-    #     # ==================================================
-    #     # DB STORE
-    #     # ==================================================
-    #     active_trade = "CE" if ce_state["active"] else "PE" if pe_state["active"] else None
-    #     active_state = ce_state if ce_state["active"] else pe_state if pe_state["active"] else {}
-
-    #     self.db_manager.store_sentiment_trade(
-    #         symbol=symbol,
-    #         sentiment_type="OI",
-    #         direction=active_trade,
-    #         strike=active_state.get("strike"),
-    #         token=active_state.get("token"),
-    #         entry_price=active_state.get("entry_price"),
-    #         exit_price=oi_exit_price_new,
-    #         current_index_price=current_price,
-    #         current_data=current_data,
-    #         option_analysis=option_analysis
-    #     )
-
-
-
-
-
-
-    # def display_enhanced_analysis_latest(
-    #     self,
-    #     symbol: str,
-    #     current_price: float,
-    #     nearest_call: Dict[str, float],
-    #     nearest_put: Dict[str, float],
-    #     current_data: Dict,
-    #     option_analysis: Dict,
-    #     oc_supports: list,
-    #     oc_resistances: list,
-    #     market_bias: str,
-    #     validated_supports: list,
-    #     validated_resistances: list
-    # ):
-    #     print(f"\n{'='*80}")
-    #     print(f"MARKET ANALYSIS: {symbol}")
-    #     print(f"{'='*80}")
-
-    #     print(f"Price: Rs.{current_price:.2f}")        
-    #     print(f"O: {current_data.get('open', 0):.2f} | H: {current_data.get('high', 0):.2f} | L: {current_data.get('low', 0):.2f} | Vol: {current_data.get('volume', 0):,}")
-
-    #     print(f"Nearest CALL strike: {nearest_call['strike_price'] if nearest_call else 'N/A'} | Last: {nearest_call['last_price'] if nearest_call else 'N/A'}")
-    #     print(f"Nearest PUT strike: {nearest_put['strike_price'] if nearest_put else 'N/A'} | Last: {nearest_put['last_price'] if nearest_put else 'N/A'}")
-
-
-    #     # ------------------------------------------------------------------
-    #     # HIGH ACCURACY SUPPORT & RESISTANCE
-    #     # ------------------------------------------------------------------
-    #     # print(f"\n🎯 VALIDATED HIGH ACCURACY LEVELS (OI + Historical Validation):")
-    #     # if validated_supports:
-    #     #     print("  SUPPORTS:")
-    #     #     for sup in validated_supports:
-    #     #         info = f"Level: {sup['level']:.0f}"
-    #     #         hist = f"Hist: {','.join([str(round(x,2)) for x in sup['historical_matches']])}" if sup['historical_matches'] else "Hist: -"
-    #     #         swing = f"Swings: {','.join([str(round(x,2)) for x in sup['swing_matches']])}" if sup['swing_matches'] else "Swings: -"
-    #     #         print(f"    {info} | {hist} | {swing}")
-    #     # else:
-    #     #     print("    No supports validated.")
-
-    #     # if validated_resistances:
-    #     #     print("  RESISTANCES:")
-    #     #     for res in validated_resistances:
-    #     #         info = f"Level: {res['level']:.0f}"
-    #     #         hist = f"Hist: {','.join([str(round(x,2)) for x in res['historical_matches']])}" if res['historical_matches'] else "Hist: -"
-    #     #         swing = f"Swings: {','.join([str(round(x,2)) for x in res['swing_matches']])}" if res['swing_matches'] else "Swings: -"
-    #     #         print(f"    {info} | {hist} | {swing}")
-    #     # else:
-    #     #     print("    No resistances validated.")
-
-
-    #     # --------------------------------------------------
-    #     # 🎯 TRADE CONFIRMATION (HIST LEVEL CROSS + REJECTION)
-    #     # --------------------------------------------------
-
-    #     candle_high  = current_data.get("high", 0)
-    #     candle_low   = current_data.get("low", 0)
-    #     candle_close = current_price
-
-    #     oi_sentiment = option_analysis.get("oi_sentiment")
-    #     delta_bias   = option_analysis.get("delta_bias_score", 50)
-    #     oi_exit_price_new = None
-    #     #================================= Test =================
-
-
-
-    #     # --------------------------------------------------
-    #     # OI STATE INIT
-    #     # --------------------------------------------------
-    #     if symbol not in CONFIG.oi_state:
-    #         CONFIG.oi_state[symbol] = {
-    #             "oi_trade": None,
-    #             "oi_strike": None,
-    #             "oi_token": None,
-    #             "oi_entry_price": None,
-    #             # 🔹 PRICE CONFIRMATION STATE
-    #             "bullish_price_confirmed": False,
-    #             "bullish_crossed_level": None,
-    #             "bearish_price_confirmed": False,
-    #             "bearish_crossed_level": None,
-    #             "last_used_bullish_level": None,
-    #             "last_used_bearish_level": None
-    #         }
-
-    #     state = CONFIG.oi_state[symbol]
-        
-        
-    #     # --------------------------------------------------
-    #     # 🟢 BULLISH PRICE CONFIRMATION (SUPPORT RECLAIM)
-    #     # --------------------------------------------------
-
-    #     hist_support_levels = []
-    #     for sup in validated_supports:
-    #         hist_support_levels.extend(sup.get("historical_matches", []))
-
-    #     hist_support_levels = list(set(hist_support_levels))
-
-    #     if hist_support_levels:
-    #         crossed_levels = [h for h in hist_support_levels if candle_low < h]
-    #         if crossed_levels:
-    #             state["bullish_crossed_level"] = max(crossed_levels)
-    #             if candle_close > state["bullish_crossed_level"]:
-    #                 state["bullish_price_confirmed"] = True
-
-    #     # --------------------------------------------------
-    #     # 🔴 BEARISH PRICE CONFIRMATION (RESISTANCE REJECTION)
-    #     # --------------------------------------------------
-
-    #     hist_resistance_levels = []
-    #     for res in validated_resistances:
-    #         hist_resistance_levels.extend(res.get("historical_matches", []))
-
-    #     hist_resistance_levels = list(set(hist_resistance_levels))
-
-    #     if hist_resistance_levels:
-    #         crossed_levels = [h for h in hist_resistance_levels if candle_high > h]
-    #         if crossed_levels:
-    #             state["bearish_crossed_level"] = min(crossed_levels)
-    #             if candle_close < state["bearish_crossed_level"]:
-    #                 state["bearish_price_confirmed"] = True
-
-    #     if state["oi_trade"] is None:
-    #             # ENTRY
-    #             print(f"ENTRY SIGNAL | {symbol} | OI Sentiment: {oi_sentiment} | Delta Bias: {delta_bias}")
-    #             if oi_sentiment == "BULLISH" and state["bullish_price_confirmed"] and nearest_call and state["bullish_crossed_level"] != state["last_used_bullish_level"]:
-    #                 state["bearish_price_confirmed"] = False
-    #                 state["bearish_crossed_level"] = None
-    #                 state["last_used_bullish_level"] = state["bullish_crossed_level"]
-    #                 state["oi_trade"] = "CE"
-    #                 state["oi_strike"] = nearest_call.get("strike_price")
-    #                 state["oi_token"] = nearest_call.get("token") or nearest_call.get("scripCode")
-    #                 state["oi_entry_price"] = nearest_call.get("last_price", 0.0)
-    #                 print(f"BUY CE SIGNAL | {symbol} | Strike {nearest_call['strike_price']} | Price {nearest_call['last_price']}")
-
-    #                 ce_scrip_code = nearest_call["scripCode"]
-    #                 ce_price = nearest_call["last_price"]
-
-    #                 qty = CONFIG.LOT_SIZES[symbol.upper()] * CONFIG.number_of_lots
-
-    #                 self.api_client.place_order_api(
-    #                         scripCode=ce_scrip_code,
-    #                         direction="BUY",
-    #                         quantity=qty,
-    #                         price=ce_price,
-    #                         strike_price=nearest_call["strike_price"],
-    #                         option_type="CE"
-    #                 )
-    #             elif oi_sentiment == "BEARISH" and state["bearish_price_confirmed"] and nearest_put and state["bearish_crossed_level"] != state["last_used_bearish_level"]:
-    #                 state["bullish_price_confirmed"] = False
-    #                 state["bullish_crossed_level"] = None
-    #                 state["last_used_bearish_level"] = state["bearish_crossed_level"]
-    #                 state["oi_trade"] = "PE"
-    #                 state["oi_strike"] = nearest_put.get("strike_price")
-    #                 state["oi_token"] = nearest_put.get("token") or nearest_put.get("scripCode")
-    #                 state["oi_entry_price"] = nearest_put.get("last_price", 0.0)
-    #                 print(f"BUY PE SIGNAL | {symbol} | Strike {nearest_put['strike_price']} | Price {nearest_put['last_price']}")
-                        
-    #                 pe_scrip_code = nearest_put["scripCode"]
-    #                 pe_price = nearest_put["last_price"]
-
-    #                 qty = CONFIG.LOT_SIZES[symbol.upper()] * CONFIG.number_of_lots
-
-    #                 self.api_client.place_order_api(
-    #                         scripCode=pe_scrip_code,
-    #                         direction="BUY",
-    #                         quantity=qty,
-    #                         price=pe_price,
-    #                         strike_price=nearest_put["strike_price"],
-    #                         option_type="PE"
-    #                     )
-    #     else:
-    #             # EXIT on sentiment flip
-    #             if state["oi_trade"] == "CE" and oi_sentiment == "BEARISH":
-    #                 print(f"SELL CE SIGNAL | {symbol} | Strike {state['oi_strike']} | Price {nearest_call.get("last_price", 0.0)}")
-    #                 oi_exit_price_new = nearest_call.get("last_price", 0.0)
-    #                 state["oi_trade"] = None
-    #                 state["oi_strike"] = None
-    #                 state["oi_token"] = None
-    #                 state["oi_entry_price"] = None
-
-    #             elif state["oi_trade"] == "PE" and oi_sentiment == "BULLISH":
-    #                 print(f"SELL PE SIGNAL | {symbol} | Strike {state['oi_strike']} | Price {nearest_put.get('last_price', 0.0)}")
-    #                 oi_exit_price_new = nearest_put.get("last_price", 0.0)
-    #                 state["oi_trade"] = None
-    #                 state["oi_strike"] = None
-    #                 state["oi_token"] = None
-    #                 state["oi_entry_price"] = None
-
-    #     self.db_manager.store_sentiment_trade(
-    #         symbol=symbol,
-    #         sentiment_type="OI",
-    #         direction=state["oi_trade"],
-    #         strike=state["oi_strike"],
-    #         token=state["oi_token"],
-    #         entry_price=state["oi_entry_price"],
-    #         exit_price=oi_exit_price_new,
-    #         current_index_price=current_price,
-    #         current_data=current_data,
-    #         option_analysis=option_analysis
-    #     )
-
-    #     # STORE TO DB
-    #     self.db_manager.store_market_analysis_summary(
-    #         symbol=symbol,
-    #         current_price=current_price,
-    #         current_data={
-    #             'open': current_data.get('open'),
-    #             'high': current_data.get('high'),
-    #             'low': current_data.get('low'),
-    #             'volume': current_data.get('volume')
-    #         },
-    #         market_bias=f"{option_analysis.get('sentiment', 'NEUTRAL')} "
-    #                     f"pcr oi : {option_analysis.get('pcr_oi', 0)} "
-    #                     f"pcr oi change : {option_analysis.get('pcr_oi_change', 0)} "
-    #                     f"pcr volume : {option_analysis.get('pcr_volume', 0)} "
-    #                     f"pcr_vol_price : {option_analysis.get('pcr_vol_price', 0)} ",
-    #         nearest_call={'strike_price': nearest_call['strike_price'], 'last_price': nearest_call['last_price']},
-    #         nearest_put={'strike_price': nearest_put['strike_price'], 'last_price': nearest_put['last_price']}
-    #     )
-        
-        
-
-        # OPTION CHAIN SUMMARY
-        # if option_analysis:
-        #     print(f"\nOPTION CHAIN:")
-        #     print(f"  Calls - Vol: {option_analysis.get('call_volume', 0):,} | OI: {option_analysis.get('call_oi', 0):,} | OI Δ: {option_analysis.get('call_oi_change', 0):,}")
-        #     print(f"  Puts  - Vol: {option_analysis.get('put_volume', 0):,} | OI: {option_analysis.get('put_oi', 0):,} | OI Δ: {option_analysis.get('put_oi_change', 0):,}")
-        #     print(f"  PCR OI: {option_analysis.get('pcr_oi', 0):.5f} | PCR OI Chg: {option_analysis.get('pcr_oi_change', 0):.5f} | "
-        #         f"PCR Vol: {option_analysis.get('pcr_volume', 0):.5f} | PCR Vol Price: {option_analysis.get('pcr_vol_price', 0):.5f}")
-        #     print(f"  Combined SENTIMENT: {option_analysis.get('sentiment', 'NEUTRAL')}\n")
-
-        # ------------------------------------------------------------------
-        # 🔥 DISPLAY SENTIMENT-BASED TRADES WITH ENTRY/EXIT PRICE
-        # ------------------------------------------------------------------
-        # print("📌 SENTIMENT TRADE STATUS")
-
-        # # =============== OI TRADE ==================
-        # print("\n👉 OI Sentiment Trade:")
-        # print(f"   Sentiment: {option_analysis.get('oi_sentiment')}")
-        # print(f"   Trade: {option_analysis.get('oi_trade')}")
-        # print(f"   Strike: {option_analysis.get('oi_strike')}")
-        # print(f"   Token: {option_analysis.get('oi_token')}")
-        # print(f"   Entry Price: {option_analysis.get('oi_entry_price')}")
-        # print(f"   Exit Price: {option_analysis.get('oi_exit_price')}")
-
-        # # =============== OI CHANGE TRADE ==================
-        # print("\n👉 OI Change Sentiment Trade:")
-        # print(f"   Sentiment: {option_analysis.get('oi_change_sentiment')}")
-        # print(f"   Trade: {option_analysis.get('oi_change_trade')}")
-        # print(f"   Strike: {option_analysis.get('oi_change_strike')}")
-        # print(f"   Token: {option_analysis.get('oi_change_token')}")
-        # print(f"   Entry Price: {option_analysis.get('oi_change_entry_price')}")
-        # print(f"   Exit Price: {option_analysis.get('oi_change_exit_price')}")
-
-        # # =============== VOLUME TRADE ==================
-        # print("\n👉 Volume Sentiment Trade:")
-        # print(f"   Sentiment: {option_analysis.get('volume_sentiment')}")
-        # print(f"   Trade: {option_analysis.get('volume_trade')}")
-        # print(f"   Strike: {option_analysis.get('volume_strike')}")
-        # print(f"   Token: {option_analysis.get('volume_token')}")
-        # print(f"   Entry Price: {option_analysis.get('volume_entry_price')}")
-        # print(f"   Exit Price: {option_analysis.get('volume_exit_price')}")
-
-
-
-        # ------------------------------------------------------------------
-        # OI ONLY S/R
-        # ------------------------------------------------------------------
-        # print(f"\nKEY OI LEVELS:")
-        # if oc_supports:
-        #     print(f"  OI Supports: {' | '.join([str(int(s)) for s in oc_supports[:3]])}")
-        # if oc_resistances:
-        #     print(f"  OI Resistances: {' | '.join([str(int(r)) for r in oc_resistances[:3]])}")
-
-        # print(f"{'='*80}\n")
-
-
-    
-    # def display_enhanced_analysis_latest(
-    #     self,
-    #     symbol: str,
-    #     current_price: float,
-    #     nearest_call: Dict[str, float],
-    #     nearest_put: Dict[str, float],
-    #     current_data: Dict,
-    #     option_analysis: Dict,
-    #     oc_supports: list,
-    #     oc_resistances: list,
-    #     market_bias: str,
-    #     validated_supports: list,
-    #     validated_resistances: list
-    # ):
-    #     print(f"\n{'='*80}")
-    #     print(f"MARKET ANALYSIS: {symbol}")
-    #     print(f"{'='*80}")
-    #     print(f"Price: Rs.{current_price:.2f}")        
-    #     print(f"O: {current_data.get('open', 0):.2f} | H: {current_data.get('high', 0):.2f} | L: {current_data.get('low', 0):.2f} | Vol: {current_data.get('volume', 0):,}")
-    #     print(f"Market Bias (OC OI): {market_bias}")    
-    #     print(f"Nearest CALL strike: {nearest_call['strike_price'] if nearest_call else 'N/A'} | Last: {nearest_call['last_price'] if nearest_call else 'N/A'}")
-    #     print(f"Nearest PUT strike: {nearest_put['strike_price'] if nearest_put else 'N/A'} | Last: {nearest_put['last_price'] if nearest_put else 'N/A'}")
-
-
-    #     self.db_manager.store_market_analysis_summary(
-    #     symbol=symbol,
-    #     current_price=current_price,
-    #     current_data={'open': current_data.get('open'), 'high': current_data.get('high'), 'low': current_data.get('low'), 'volume': current_data.get('volume')},
-    #     market_bias=f"{option_analysis.get('sentiment', 'NEUTRAL')} pcr oi : {option_analysis.get('pcr_oi', 0)} pcr oi change : {option_analysis.get('pcr_oi_change', 0)} pcr volume : {option_analysis.get('pcr_volume', 0)} pcr_vol_price : {option_analysis.get('pcr_vol_price', 0)} buy_action : {option_analysis.get('buy_action', 0)} buy_strike : {option_analysis.get('buy_strike', 0)} buy_strike_code : {option_analysis.get('buy_strike_code', 0)} ",
-    #     nearest_call={'strike_price': nearest_call['strike_price'], 'last_price': nearest_call['last_price']},
-    #     nearest_put={'strike_price': nearest_put['strike_price'], 'last_price': nearest_put['last_price']}
-    #     )
-
-    #     # Option Chain Analysis
-    #     if option_analysis:
-    #         print(f"\nOPTION CHAIN:")
-    #         print(f"  Calls - Vol: {option_analysis.get('call_volume', 0):,} | OI: {option_analysis.get('call_oi', 0):,} | OI Δ: {option_analysis.get('call_oi_change', 0):,}")
-    #         print(f"  Puts  - Vol: {option_analysis.get('put_volume', 0):,} | OI: {option_analysis.get('put_oi', 0):,} | OI Δ: {option_analysis.get('put_oi_change', 0):,}")
-    #         print(f"  PCR OI: {option_analysis.get('pcr_oi', 0):.5f} PCR OI Change: {option_analysis.get('pcr_oi_change', 0):.5f} PCR volume: {option_analysis.get('pcr_volume', 0):.5f} | PCR Vol Price: {option_analysis.get('pcr_vol_price', 0):.5f}| SENTIMENT: {option_analysis.get('sentiment', 'NEUTRAL')}")
-
-    #     # High Accuracy Support and Resistance Section
-    #     print(f"\n🎯 VALIDATED HIGH ACCURACY LEVELS (OI + Historical Validation):")
-    #     if validated_supports:
-    #         print("  SUPPORTS:")
-    #         for sup in validated_supports:
-    #             info = f"Level: {sup['level']:.0f}"
-    #             hist = f"Hist: {','.join([str(round(x,2)) for x in sup['historical_matches']])}" if sup['historical_matches'] else "Hist: -"
-    #             swing = f"Swings: {','.join([str(round(x,2)) for x in sup['swing_matches']])}" if sup['swing_matches'] else "Swings: -"
-    #             print(f"    {info} | {hist} | {swing}")
-    #     else:
-    #         print("    No supports validated.")
-
-    #     if validated_resistances:
-    #         print("  RESISTANCES:")
-    #         for res in validated_resistances:
-    #             info = f"Level: {res['level']:.0f}"
-    #             hist = f"Hist: {','.join([str(round(x,2)) for x in res['historical_matches']])}" if res['historical_matches'] else "Hist: -"
-    #             swing = f"Swings: {','.join([str(round(x,2)) for x in res['swing_matches']])}" if res['swing_matches'] else "Swings: -"
-    #             print(f"    {info} | {hist} | {swing}")
-    #     else:
-    #         print("    No resistances validated.")
-
-    #     # OI Only S/R
-    #     print(f"\nKEY OI LEVELS:")
-    #     if oc_supports:
-    #         print(f"  OI Supports: {' | '.join([str(int(s)) for s in oc_supports[:3]])}")
-    #     if oc_resistances:
-    #         print(f"  OI Resistances: {' | '.join([str(int(r)) for r in oc_resistances[:3]])}")
-
-    #     print(f"{'='*80}\n")
-
-    def display_enhanced_analysis(self, symbol: str, current_price: float, current_data: Dict,
-                                option_analysis: Dict, oc_supports: List, oc_resistances: List,
-                                high_accuracy_supports: List, high_accuracy_resistances: List) -> None:
-        """Display comprehensive analysis with high accuracy levels."""
-        
-        print(f"\n{'-'*80}")
-        print(f"MARKET ANALYSIS: {symbol}")
-        print(f"{'-'*80}")
-        print(f"Price: Rs.{current_price:.2f} | O: {current_data.get('close', 0):.2f} | "
-              f"H: {current_data.get('high', 0):.2f} | L: {current_data.get('low', 0):.2f} | "
-              f"Vol: {current_data.get('volume', 0):,}")
-        
-        # Option Chain Analysis
-        if option_analysis:
-            print(f"\nOPTION CHAIN:")
-            print(f"  Calls - Vol: {option_analysis.get('call_volume', 0):,} | "
-                  f"OI: {option_analysis.get('call_oi', 0):,} | "
-                  f"OI Δ: {option_analysis.get('call_oi_change', 0):,}")
-            print(f"  Puts  - Vol: {option_analysis.get('put_volume', 0):,} | "
-                  f"OI: {option_analysis.get('put_oi', 0):,} | "
-                  f"OI Δ: {option_analysis.get('put_oi_change', 0):,}")
-            print(f"  PCR: {option_analysis.get('pcr_oi', 0):.3f} | "
-                  f"SENTIMENT: {option_analysis.get('sentiment', 'NEUTRAL')}")
-        
-        # NEW: High Accuracy Support and Resistance Section
-        if high_accuracy_supports or high_accuracy_resistances:
-            print(f"\n🎯 HIGH ACCURACY LEVELS (OI + Historical Validation):")
-            
-            if high_accuracy_supports:
-                print(f"  SUPPORTS:")
-                for sup in high_accuracy_supports:
-                    print(f"    {sup['level']:.0f} - Score: {sup['accuracy_score']} | "
-                          f"Touches: {sup['touch_count']} | Swings: {sup['swing_confirmations']} | "
-                          f"Strength: {sup['strength']}")
-            
-            if high_accuracy_resistances:
-                print(f"  RESISTANCES:")
-                for res in high_accuracy_resistances:
-                    print(f"    {res['level']:.0f} - Score: {res['accuracy_score']} | "
-                          f"Touches: {res['touch_count']} | Swings: {res['swing_confirmations']} | "
-                          f"Strength: {res['strength']}")
-        
-        # Standard Support and Resistance
-        print(f"\nKEY LEVELS:")
-        if oc_supports:
-            print(f"  OI Supports: {' | '.join([f'{s:.0f}' for s in oc_supports[:3]])}")
-        if oc_resistances:
-            print(f"  OI Resistance: {' | '.join([f'{r:.0f}' for r in oc_resistances[:3]])}")
-        # if hist_supports:
-        #     print(f"  Price Supports: {' | '.join([f'{s:.0f}' for s in hist_supports[:3]])}")
-        # if hist_resistances:
-        #     print(f"  Price Resistance: {' | '.join([f'{r:.0f}' for r in hist_resistances[:3]])}")
-            
-        # if hist_supports15:
-        #     print(f"  Price Supports 15: {' | '.join([f'{s:.0f}' for s in hist_supports15[:10]])}")
-        # if hist_resistances15:
-        #     print(f"  Price Resistance 15: {' | '.join([f'{r:.0f}' for r in hist_resistances15[:10]])}")
-        
-        print(f"{'-'*80}")
-
+              
 # ===============================
 # MAIN EXECUTION
 # ===============================
@@ -3648,4 +3003,3 @@ def main():
 
 if __name__ == "__main__":
     exit(main())
-
