@@ -576,9 +576,21 @@ class APIClient:
             return []
         try:
             scrip_info  = self.find_scrip_info(symbol)
+          
+            if scrip_info is None:
+              Logger.error(f"Scrip info not found for {symbol}")
+              return []
+            
             expiry_data = self.client.get_expiry(scrip_info['Exch'], symbol)
-            if not expiry_data or 'Expiry' not in expiry_data or not expiry_data['Expiry']:
+          
+            if not expiry_data:
+              Logger.error(f"No expiry data for {symbol}")
+              return []
+
+            if 'Expiry' not in expiry_data or not expiry_data['Expiry']:
+                Logger.error(f"Invalid expiry data for {symbol}")
                 return []
+              
             expiry_date_str = expiry_data['Expiry'][0]['ExpiryDate']
             match = re.search(r'/Date\((\d+)', expiry_date_str)
             if not match:
