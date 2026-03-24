@@ -17,6 +17,15 @@ def rows_to_list(rows):
     return [dict(r) for r in rows]
 
 
+def safe_rows(result):
+    try:
+        if result and hasattr(result, "rows") and result.rows:
+            return result.rows
+        return []
+    except Exception:
+        return []
+
+
 # ─────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────
@@ -29,7 +38,6 @@ def index():
 # ── Trades ───────────────────────────────
 @app.route("/api/trades")
 def api_trades():
-    symbol = request.args.get("symbol", "").upper()
     status = request.args.get("status", "ALL").upper()
     today  = date.today().isoformat()
 
@@ -40,13 +48,11 @@ def api_trades():
             result = db.execute(
                 "SELECT * FROM option_trades WHERE status='OPEN' ORDER BY entry_time DESC"
             )
-
         elif status == "CLOSED":
             result = db.execute(
                 "SELECT * FROM option_trades WHERE status='CLOSED' AND date(entry_time)=? ORDER BY exit_time DESC",
                 [today]
             )
-
         else:
             result = db.execute(
                 "SELECT * FROM option_trades ORDER BY entry_time DESC LIMIT 200"
@@ -56,6 +62,7 @@ def api_trades():
         return jsonify(rows_to_list(rows))
 
     except Exception as e:
+        print("TRADES ERROR:", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -78,11 +85,14 @@ def api_summary():
         """, [today, today, today])
 
         rows = safe_rows(result)
+
         if not rows:
             return jsonify({})
+
         return jsonify(dict(rows[0]))
 
     except Exception as e:
+        print("SUMMARY ERROR:", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -99,12 +109,12 @@ def api_option_chain():
             [symbol]
         )
 
-        rows = safe_rows(ts_result)
+        ts_rows = safe_rows(ts_result)
 
-        if not rows or not rows[0].get("ts"):
+        if not ts_rows or not ts_rows[0].get("ts"):
             return jsonify([])
 
-        latest_ts = ts_result.rows[0]["ts"]
+        latest_ts = ts_rows[0]["ts"]
 
         result = db.execute("""
             SELECT strike_price, option_type, last_price, volume,
@@ -114,9 +124,11 @@ def api_option_chain():
             ORDER BY strike_price ASC
         """, [symbol, latest_ts])
 
-        return jsonify(rows_to_list(result.rows))
+        rows = safe_rows(result)
+        return jsonify(rows_to_list(rows))
 
     except Exception as e:
+        print("OPTION CHAIN ERROR:", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -136,9 +148,11 @@ def api_chart():
             LIMIT 200
         """, [symbol])
 
+        rows = safe_rows(result)
+
         candles = []
 
-        for r in result.rows:
+        for r in rows:
             try:
                 ts = datetime.fromisoformat(r["timestamp"])
                 candles.append({
@@ -154,6 +168,7 @@ def api_chart():
         return jsonify(candles)
 
     except Exception as e:
+        print("CHART ERROR:", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -171,8 +186,10 @@ def api_market_summary():
             ORDER BY timestamp DESC LIMIT 1
         """, [symbol])
 
-        if result.rows:
-            return jsonify(dict(result.rows[0]))
+        rows = safe_rows(result)
+
+        if rows:
+            return jsonify(dict(rows[0]))
 
         fallback = db.execute("""
             SELECT open_price as open, high, low, close, volume
@@ -181,14 +198,17 @@ def api_market_summary():
             ORDER BY timestamp DESC LIMIT 1
         """, [symbol])
 
-        if fallback.rows:
-            d = dict(fallback.rows[0])
+        f_rows = safe_rows(fallback)
+
+        if f_rows:
+            d = dict(f_rows[0])
             d["current_price"] = d.get("close", 0)
-        return jsonify(d)
+            return jsonify(d)
 
         return jsonify({"current_price": 0})
 
     except Exception as e:
+        print("MARKET SUMMARY ERROR:", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -211,9 +231,11 @@ def api_strategy_stats():
             ORDER BY total_pnl DESC
         """)
 
-        return jsonify(rows_to_list(result.rows))
+        rows = safe_rows(result)
+        return jsonify(rows_to_list(rows))
 
     except Exception as e:
+        print("STRATEGY ERROR:", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -230,10 +252,4 @@ def api_health():
 # ── RUN ─────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
-
-    print("\n" + "="*50)
-    print("🚀 TradeSys Turso Dashboard Running")
-    print("="*50 + "\n")
-
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    app.run(host="0.0.0.0", port=port)
