@@ -27,11 +27,8 @@ TARGET LOGIC (per strategy, added in v5):
 """
 import asyncio
 
-try:
-    loop = asyncio.get_running_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 import json
 import os
@@ -1870,19 +1867,26 @@ class SimplifiedTradingSystem:
 # MAIN
 # ===============================
 
-def main():
+# ===============================
+# MAIN (FIXED)
+# ===============================
+
+import asyncio
+
+async def main():
     print("\n" + "="*80)
     print("  PROFESSIONAL TRADING SYSTEM v5.0")
     print("  S1-Zone | S2-EMA | S3-VWAP | S4-BB | S5-RSI | S6-MACD | S7-ORB | S8-Swing")
     print("  TARGETS: SL + Target on every strategy (option premium based)")
     print("="*80)
+
     try:
         system = SimplifiedTradingSystem()
-        system.run_analysis_loop()
+        system.run_analysis_loop()   # your existing loop
     except Exception as e:
         Logger.error(f"Startup error: {e}")
-        return 1
-    return 0
+        await asyncio.sleep(5)  # prevent crash loop
+
 
 if __name__ == "__main__":
-    exit(main())
+    asyncio.run(main())
