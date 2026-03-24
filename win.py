@@ -25,6 +25,13 @@ TARGET LOGIC (per strategy, added in v5):
     S7: 1:2.0  (ORB - breakout)
     S8: 1:2.0  (Swing/Trendline - structure)
 """
+import asyncio
+
+try:
+    loop = asyncio.get_running_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
 import json
 import os
@@ -48,11 +55,6 @@ import trendln
 from scipy.stats import norm
 from turso_db import get_db
 
-import asyncio
-try:
-    asyncio.get_running_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
   
 warnings.filterwarnings('ignore')
 
