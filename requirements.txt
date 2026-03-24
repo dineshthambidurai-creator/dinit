@@ -1,3 +1,4 @@
+trendln
 libsql-client
 flask
 gunicorn
