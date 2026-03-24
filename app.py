@@ -19,10 +19,25 @@ def rows_to_list(rows):
 
 def safe_rows(result):
     try:
-        if result and hasattr(result, "rows") and result.rows:
-            return result.rows
+        if result is None:
+            return []
+
+        # Turso normal
+        if hasattr(result, "rows"):
+            return result.rows or []
+
+        # fallback
+        if isinstance(result, list):
+            return result
+
+        # edge case
+        if hasattr(result, "results"):
+            return result.results
+
         return []
-    except Exception:
+
+    except Exception as e:
+        print("safe_rows error:", e)
         return []
 
 
