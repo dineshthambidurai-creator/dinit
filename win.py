@@ -49,8 +49,6 @@ import pyotp
 import ta
 from py5paisa import FivePaisaClient
 import trendln
-import gzip
-import json
 from scipy.stats import norm
 from turso_db import get_db
 
@@ -465,41 +463,43 @@ class APIClient:
             Logger.error(f"API init failed: {e}")
             return False
 
-  def load_scrips_data(self, file_path="scrips_data.json.gz"):
-      if self._scrips_cache is not None:
-          return self._scrips_cache
-  
-      try:
-          if os.path.exists(file_path):
-              Logger.info("Loading scrips from compressed file...")
-  
-              import gzip
-              import json
-  
-              with gzip.open(file_path, "rt") as f:
-                  data = json.load(f)
-  
-              self._scrips_cache = pd.DataFrame(data)
-  
-              Logger.success(f"Scrips loaded: {len(self._scrips_cache)}")
-              return self._scrips_cache
-  
-          if not self.client:
-              return None
-  
-          Logger.info("Fetching scrips from API...")
-  
-          with SuppressPrints():
-              scrips_live = self.client.get_scrips()
-  
-          if scrips_live is not None and not scrips_live.empty:
-              self._scrips_cache = scrips_live
-              return scrips_live
-  
-      except Exception as e:
-          Logger.error(f"Load scrips failed: {e}")
-  
-      return None
+      def load_scrips_data(self, file_path="scrips_data.json.gz"):
+        if self._scrips_cache is not None:
+            return self._scrips_cache
+
+        try:
+            import os
+            import gzip
+            import json
+            import pandas as pd
+
+            if os.path.exists(file_path):
+                Logger.info("Loading scrips from compressed file...")
+
+                with gzip.open(file_path, "rt") as f:
+                    data = json.load(f)
+
+                self._scrips_cache = pd.DataFrame(data)
+
+                Logger.success(f"Scrips loaded: {len(self._scrips_cache)}")
+                return self._scrips_cache
+
+            if not self.client:
+                return None
+
+            Logger.info("Fetching scrips from API...")
+
+            with SuppressPrints():
+                scrips_live = self.client.get_scrips()
+
+            if scrips_live is not None and not scrips_live.empty:
+                self._scrips_cache = scrips_live
+                return scrips_live
+
+        except Exception as e:
+            Logger.error(f"Load scrips failed: {e}")
+
+        return None
 
     def find_scrip_info(self, symbol):
         scrips_df = self.load_scrips_data()
