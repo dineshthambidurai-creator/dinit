@@ -462,8 +462,8 @@ class APIClient:
         except Exception as e:
             Logger.error(f"API init failed: {e}")
             return False
-
-      def load_scrips_data(self, file_path="scrips_data.json.gz"):
+  
+  def load_scrips_data(self, file_path="scrips_data.json.gz"):
         if self._scrips_cache is not None:
             return self._scrips_cache
 
