@@ -52,7 +52,8 @@ def api_trades():
                 "SELECT * FROM option_trades ORDER BY entry_time DESC LIMIT 200"
             )
 
-        return jsonify(rows_to_list(result.rows))
+        rows = safe_rows(result)
+        return jsonify(rows_to_list(rows))
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -76,7 +77,10 @@ def api_summary():
             FROM option_trades
         """, [today, today, today])
 
-        return jsonify(dict(result.rows[0]))
+        rows = safe_rows(result)
+        if not rows:
+            return jsonify({})
+        return jsonify(dict(rows[0]))
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -95,7 +99,9 @@ def api_option_chain():
             [symbol]
         )
 
-        if not ts_result.rows or not ts_result.rows[0]["ts"]:
+        rows = safe_rows(ts_result)
+
+        if not rows or not rows[0].get("ts"):
             return jsonify([])
 
         latest_ts = ts_result.rows[0]["ts"]
@@ -178,7 +184,7 @@ def api_market_summary():
         if fallback.rows:
             d = dict(fallback.rows[0])
             d["current_price"] = d.get("close", 0)
-            return jsonify(d)
+        return jsonify(d)
 
         return jsonify({"current_price": 0})
 
