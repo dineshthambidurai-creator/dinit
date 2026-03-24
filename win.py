@@ -463,24 +463,30 @@ class APIClient:
             return False
 
     def load_scrips_data(self, file_path="scrips_data.json"):
-        if self._scrips_cache is not None:
-            return self._scrips_cache
-        try:
-            if os.path.exists(file_path):
-                with open(file_path, 'r') as f:
-                    self._scrips_cache = pd.DataFrame(json.load(f))
-                return self._scrips_cache
-            if not self.client:
-                return None
-            with SuppressPrints():
-                scrips_live = self.client.get_scrips()
-            if scrips_live is not None and not scrips_live.empty:
-                scrips_live.to_json(file_path, orient='records', indent=4)
-                self._scrips_cache = scrips_live
-                return scrips_live
-        except Exception as e:
-            Logger.error(f"Load scrips failed: {e}")
-        return None
+      if self._scrips_cache is not None:
+          return self._scrips_cache
+  
+      try:
+          if not self.client:
+              Logger.error("Client not initialized")
+              return None
+  
+          Logger.info("Fetching scrips from API...")
+  
+          with SuppressPrints():
+              scrips_live = self.client.get_scrips()
+  
+          if scrips_live is not None and not scrips_live.empty:
+              self._scrips_cache = scrips_live
+              Logger.success(f"Scrips loaded: {len(scrips_live)}")
+              return scrips_live
+  
+          Logger.error("Empty scrips response")
+  
+      except Exception as e:
+          Logger.error(f"Load scrips failed: {e}")
+  
+      return None
 
     def find_scrip_info(self, symbol):
         scrips_df = self.load_scrips_data()
