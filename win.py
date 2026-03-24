@@ -466,13 +466,15 @@ class APIClient:
             return False
 
   def load_scrips_data(self, file_path="scrips_data.json.gz"):
-  
       if self._scrips_cache is not None:
           return self._scrips_cache
   
       try:
           if os.path.exists(file_path):
               Logger.info("Loading scrips from compressed file...")
+  
+              import gzip
+              import json
   
               with gzip.open(file_path, "rt") as f:
                   data = json.load(f)
@@ -482,7 +484,6 @@ class APIClient:
               Logger.success(f"Scrips loaded: {len(self._scrips_cache)}")
               return self._scrips_cache
   
-          # fallback to API
           if not self.client:
               return None
   
