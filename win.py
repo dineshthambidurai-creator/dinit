@@ -1,9 +1,29 @@
 """
-Professional Trading System - Complete Version with Enhanced Fibonacci Analysis
-Focus: Option Chain Analysis, Technical Indicators, Market Analysis, and Fibonacci Trend Detection
-Fixed: Proper positions handling for 5Paisa API direct list response
-Added: Comprehensive Fibonacci uptrend/downtrend analysis
-Enhanced: High Accuracy Support/Resistance combining OI + Historical validation
+Professional Trading System v5.0
+Strategies:
+  S1 - Zone Bounce
+  S2 - EMA 9/21 Crossover + OI Sentiment
+  S3 - VWAP Reclaim/Break + RSI Momentum
+  S4 - Bollinger Band Breakout + Volume Surge + OI Sentiment
+  S5 - RSI Extreme at Validated Support/Resistance
+  S6 - MACD Zero-Line Cross + Stochastic Alignment
+  S7 - 9:30 Opening Range Breakout (ORB)
+  S8 - Swing High/Low + Trendline Break + Candlestick Pattern
+
+TARGET LOGIC (per strategy, added in v5):
+  Every strategy now has:
+    • sl_price   — stop loss stored in trade state and DB
+    • target_price — profit target stored in trade state and DB
+    • Exit fires on: signal reversal OR SL hit OR TARGET hit OR force EOD
+  Risk:Reward ratios per strategy:
+    S1: 1:1.5  (zone bounce - tight)
+    S2: 1:2.0  (EMA cross - trend following)
+    S3: 1:1.5  (VWAP - mean reversion)
+    S4: 1:2.5  (BB breakout - momentum)
+    S5: 1:2.0  (RSI extreme - reversal)
+    S6: 1:2.0  (MACD - momentum)
+    S7: 1:2.0  (ORB - breakout)
+    S8: 1:2.0  (Swing/Trendline - structure)
 """
 
 import json
@@ -14,26 +34,42 @@ import warnings
 import sqlite3
 import threading
 import math
+import re
 from datetime import datetime, timedelta, time as dtime
 from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass, field
-
+from collections import deque
+from statistics import mean
 
 import numpy as np
 import pandas as pd
 import pyotp
 import ta
 from py5paisa import FivePaisaClient
+import trendln
+from scipy.stats import norm
 
 warnings.filterwarnings('ignore')
+
+# ───────────────────────────────────────────────────────────
+# RISK : REWARD RATIOS  (SL multiplier → Target multiplier)
+# ───────────────────────────────────────────────────────────
+RR = {
+    "S1": 1.5,
+    "S2": 2.0,
+    "S3": 1.5,
+    "S4": 2.5,
+    "S5": 2.0,
+    "S6": 2.0,
+    "S7": 2.0,
+    "S8": 2.0,
+}
 
 # ===============================
 # UTILITY CLASSES
 # ===============================
 
 class SuppressPrints:
-    """Context manager to suppress print statements."""
-    
     def __enter__(self):
         self._original_stdout = sys.stdout
         self._original_stderr = sys.stderr
@@ -47,28 +83,21 @@ class SuppressPrints:
         sys.stdout = self._original_stdout
         sys.stderr = self._original_stderr
 
+
 class Logger:
-    """Simple logging utility - Fixed encoding issues."""
     @staticmethod
     def _log(level, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
         print(f"{timestamp} | {level} | {message}", flush=True)
-        
+
     @staticmethod
-    def info(message: str) -> None:
-        Logger._log("INFO", message)
-    
+    def info(message):    Logger._log("INFO",    message)
     @staticmethod
-    def success(message: str) -> None:
-        Logger._log("SUCCESS", message)
-    
+    def success(message): Logger._log("SUCCESS", message)
     @staticmethod
-    def error(message: str) -> None:
-        Logger._log("ERROR", message)
-    
+    def error(message):   Logger._log("ERROR",   message)
     @staticmethod
-    def warning(message: str) -> None:
-        Logger._log("WARNING", message)
+    def warning(message): Logger._log("WARNING", message)
 
 # ===============================
 # CONFIGURATION
@@ -76,631 +105,542 @@ class Logger:
 
 @dataclass
 class TradingConfig:
-    """Trading configuration constants."""
     SYMBOLS: List[str] = None
     STRIKE_STEPS: Dict[str, int] = None
-    LOT_SIZES: Dict[str, int] = None 
+    LOT_SIZES: Dict[str, int] = None
     DATABASE_PATH: str = "trading_data.db"
-    DATA_UPDATE_INTERVAL: int = 23  # seconds
+    DATA_UPDATE_INTERVAL: int = 23
     number_of_lots: int = 1
     oi_state: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    orb_state: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    delta_oi_state: Dict[str, Any] = field(default_factory=lambda: {
+        "active": False,
+        "side": None,
+        "entry_price": None
+    })
 
-
-    
     def __post_init__(self):
-        
         if self.SYMBOLS is None:
-            # self.SYMBOLS = ['NIFTY']
-            self.SYMBOLS = ['NIFTY', 'BANKNIFTY', 'FINNIFTY',  'MIDCPNIFTY', 'SENSEX']
-            # self.SYMBOLS = ['NIFTY', 'BANKNIFTY']
+            self.SYMBOLS = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'SENSEX']
 
-        
         if self.STRIKE_STEPS is None:
             self.STRIKE_STEPS = {
-                'NIFTY': 50,
-                'BANKNIFTY': 100,
-                'BANKEX': 100,
-                'FINNIFTY': 50, 
-                'SENSEX': 100,
-                'MIDCPNIFTY': 50  
+                'NIFTY': 50, 'BANKNIFTY': 100, 'BANKEX': 100,
+                'FINNIFTY': 50, 'SENSEX': 100, 'MIDCPNIFTY': 50
             }
-            
-        # ================= LOT SIZES (UPDATED – DEC 2025) =================
+
         if self.LOT_SIZES is None:
             self.LOT_SIZES = {
-                'NIFTY': 65,
-                'BANKNIFTY': 30,
-                'FINNIFTY': 60,
-                'MIDCPNIFTY': 120,
-                'SENSEX': 20
+                'NIFTY': 65, 'BANKNIFTY': 30, 'FINNIFTY': 60,
+                'MIDCPNIFTY': 120, 'SENSEX': 20
             }
 
 CONFIG = TradingConfig()
 
 # ===============================
-# DATABASE MANAGER
+# TRADE STATE HELPER
 # ===============================
-
 
 def new_trade_state():
     return {
-        "active": False,
-        "trade_id": None,
-        "strike": None,
-        "token": None,
-        "entry_price": None,
-        "qty": None,      
+        "active":          False,
+        "trade_id":        None,
+        "strike":          None,
+        "token":           None,
+        "symbol":          None,
+        "entry_price":     None,
+        "qty":             None,
         "last_used_level": None,
-        "entry_oi": None,
-        "entry_delta": None
+        "entry_oi":        None,
+        "entry_delta":     None,
+        # S7 ORB
+        "orb_high":        None,
+        "orb_low":         None,
+        # S8 Swing
+        "swing_level":     None,
+        "pattern":         None,
+        # TARGETS & SL (all strategies)
+        "sl_price":        None,
+        "target_price":    None,
     }
 
+# ===============================
+# DATABASE MANAGER
+# ===============================
+
 class DatabaseManager:
-    """Handles SQLite database operations."""
-    
     def __init__(self, db_path: str = None):
         self.db_path = db_path or CONFIG.DATABASE_PATH
         self.lock = threading.Lock()
         self._initialize_database()
-    
-    def _initialize_database(self) -> None:
-        """Initialize database tables."""
+
+    def _initialize_database(self):
         try:
             with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS option_chain_data (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        symbol TEXT NOT NULL,
-                        strike_price REAL NOT NULL,
-                        option_type TEXT NOT NULL,
-                        last_price REAL,
-                        bid REAL,
-                        ask REAL,
-                        volume INTEGER,
-                        open_interest INTEGER,
-                        change_in_oi INTEGER,
-                        implied_volatility REAL
-                    )
-                """)
-                
-                cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_option_chain_symbol_timestamp 
-                    ON option_chain_data(symbol, timestamp, strike_price, option_type)
-                """)
-                
-                # Market data table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS market_data (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        symbol TEXT NOT NULL,
-                        open_price REAL,
-                        high REAL,
-                        low REAL,
-                        close REAL,
-                        volume INTEGER
-                    )
-                """)
-                
-                cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_market_data_symbol_timestamp 
-                    ON market_data(symbol, timestamp)
-                """)
-                # Add table for market analysis summary
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS market_analysis_summary (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        symbol TEXT NOT NULL,
-                        current_price REAL,
-                        market_open REAL,
-                        market_high REAL,
-                        market_low REAL,
-                        market_volume INTEGER,
-                        market_bias TEXT,
-                        nearest_call_strike REAL,
-                        nearest_call_last REAL,
-                        nearest_put_strike REAL,
-                        nearest_put_last REAL
-                    )
-                """)
+                c = conn.cursor()
 
-                cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_market_analysis_summary_symbol_timestamp 
-                    ON market_analysis_summary(symbol, timestamp)
-                """)
+                c.execute("""CREATE TABLE IF NOT EXISTS option_chain_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    symbol TEXT NOT NULL, strike_price REAL NOT NULL,
+                    option_type TEXT NOT NULL, last_price REAL, bid REAL, ask REAL,
+                    volume INTEGER, open_interest INTEGER,
+                    change_in_oi INTEGER, implied_volatility REAL)""")
 
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS sentiment_option_trades (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        symbol TEXT NOT NULL,
+                c.execute("""CREATE INDEX IF NOT EXISTS idx_oc_sym_ts
+                    ON option_chain_data(symbol, timestamp, strike_price, option_type)""")
 
-                        -- SENTIMENT TYPE
-                        sentiment_type TEXT,      -- OI, OI_CHANGE, VOLUME
+                c.execute("""CREATE TABLE IF NOT EXISTS market_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    symbol TEXT NOT NULL, open_price REAL, high REAL,
+                    low REAL, close REAL, volume INTEGER)""")
 
-                        -- TRADE INFO
-                        direction TEXT,           -- CE or PE
-                        strike REAL,
-                        token TEXT,
-                        entry_price REAL,
-                        exit_price REAL,
+                c.execute("""CREATE INDEX IF NOT EXISTS idx_md_sym_ts
+                    ON market_data(symbol, timestamp)""")
 
-                        -- UNDERLYING PRICE
-                        current_index_price REAL,
+                # option_trades — now includes target_price
+                c.execute("""CREATE TABLE IF NOT EXISTS option_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL, strategy TEXT, option_type TEXT,
+                    strike REAL, token TEXT, qty INTEGER,
+                    entry_price REAL, current_price REAL, exit_price REAL, pnl REAL,
+                    status TEXT, entry_oi TEXT, entry_delta REAL,
+                    orb_high REAL, orb_low REAL,
+                    sl_price REAL, target_price REAL,
+                    swing_level REAL, pattern TEXT,
+                    exit_reason TEXT,
+                    entry_time DATETIME DEFAULT CURRENT_TIMESTAMP, exit_time DATETIME)""")
 
-                        -- EXISTING MARKET DATA
-                        market_open REAL,
-                        market_high REAL,
-                        market_low REAL,
-                        market_volume REAL,
+                c.execute("""CREATE INDEX IF NOT EXISTS idx_ot_sym_status
+                    ON option_trades(symbol, status)""")
+                c.execute("""CREATE INDEX IF NOT EXISTS idx_ot_strategy
+                    ON option_trades(strategy)""")
+                c.execute("""CREATE INDEX IF NOT EXISTS idx_ot_entry_time
+                    ON option_trades(entry_time)""")
 
-                        -- OPTION CHAIN RAW DATA
-                        call_volume REAL,
-                        put_volume REAL,
-                        call_oi REAL,
-                        put_oi REAL,
-                        call_oi_change REAL,
-                        put_oi_change REAL,
-
-                        -- PCR DATA
-                        pcr_oi REAL,
-                        pcr_oi_change REAL,
-                        pcr_volume REAL,
-                        pcr_vol_price REAL,
-
-                        -- SENTIMENT VALUES
-                        oi_sentiment TEXT,
-                        oi_change_sentiment TEXT,
-                        volume_sentiment TEXT,
-                        combined_sentiment TEXT
-                    )
-                """)
-
-                cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_sentiment_option_trades_symbol_timestamp 
-                    ON sentiment_option_trades(symbol, timestamp)
-                """)
-
-                cursor.execute("""
-                CREATE TABLE IF NOT EXISTS delta_oi_trades (
+                c.execute("""CREATE TABLE IF NOT EXISTS sentiment_option_trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     symbol TEXT NOT NULL,
+                    sentiment_type TEXT, direction TEXT, strike REAL, token TEXT,
+                    entry_price REAL, exit_price REAL, current_index_price REAL,
+                    market_open REAL, market_high REAL, market_low REAL, market_volume REAL,
+                    call_volume REAL, put_volume REAL, call_oi REAL, put_oi REAL,
+                    call_oi_change REAL, put_oi_change REAL,
+                    pcr_oi REAL, pcr_oi_change REAL, pcr_volume REAL, pcr_vol_price REAL,
+                    oi_sentiment TEXT, oi_change_sentiment TEXT,
+                    volume_sentiment TEXT, combined_sentiment TEXT,
+                    avg_iv REAL, iv_rank REAL, iv_percentile REAL,
+                    gamma_flip_level REAL, delta_bias_score REAL,
+                    sl_points REAL, target_points REAL, trade_signal TEXT)""")
 
-                    trade_side TEXT,              -- BUY_CE / BUY_PE
-                    oi_sentiment TEXT,            -- BULLISH / BEARISH
+                c.execute("""CREATE INDEX IF NOT EXISTS idx_sot_sym_ts
+                    ON sentiment_option_trades(symbol, timestamp)""")
 
-                    entry_price REAL,
-                    current_price REAL,
-                    exit_price REAL,
-
-                    pcr_oi REAL,
-                    delta_bias_score REAL,
-                    gamma_flip_level REAL,
-
-                    status TEXT                   -- OPEN / CLOSED
-                )
-                """)
-
-                cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_delta_oi_trades_symbol_timestamp
-                ON delta_oi_trades(symbol, timestamp)
-                """)
-
-                cursor.execute("""
-                CREATE TABLE IF NOT EXISTS option_trades (
+                c.execute("""CREATE TABLE IF NOT EXISTS delta_oi_trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     symbol TEXT NOT NULL,
-                    strategy TEXT,
-                    option_type TEXT,
+                    trade_side TEXT, oi_sentiment TEXT,
+                    entry_price REAL, current_price REAL, exit_price REAL,
+                    pcr_oi REAL, delta_bias_score REAL, gamma_flip_level REAL,
+                    status TEXT)""")
 
-                    strike REAL,
-                    token TEXT,
-                    qty INTEGER,
+                c.execute("""CREATE INDEX IF NOT EXISTS idx_dot_sym_ts
+                    ON delta_oi_trades(symbol, timestamp)""")
 
-                    entry_price REAL,
-                    current_price REAL,
-                    exit_price REAL,
-                    pnl REAL,
+                c.execute("""CREATE TABLE IF NOT EXISTS market_analysis_summary (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    symbol TEXT NOT NULL, current_price REAL,
+                    market_open REAL, market_high REAL, market_low REAL, market_volume INTEGER,
+                    market_bias TEXT, nearest_call_strike REAL, nearest_call_last REAL,
+                    nearest_put_strike REAL, nearest_put_last REAL)""")
 
-                    status TEXT,
-
-                    entry_oi TEXT,
-                    entry_delta REAL,
-
-                    entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    exit_time DATETIME
-                )
-                """)
-                
-                cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_option_trades_symbol_status
-                ON option_trades(symbol, status)
-                """)
-                cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_option_trades_strategy
-                ON option_trades(strategy)
-                """)
-                cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_option_trades_entry_time
-                ON option_trades(entry_time)
-                """)
+                c.execute("""CREATE INDEX IF NOT EXISTS idx_mas_sym_ts
+                    ON market_analysis_summary(symbol, timestamp)""")
 
                 conn.commit()
-                
         except Exception as e:
-            Logger.error(f"Failed to initialize database: {e}")
+            Logger.error(f"DB init failed: {e}")
             raise
 
-    def store_market_analysis_summary(self, symbol: str, current_price: float, current_data: Dict, market_bias: str, nearest_call: Dict, nearest_put: Dict) -> None:
+        self._migrate_database()
+
+    def _migrate_database(self):
+        """Safe migration — adds missing columns without touching existing data."""
+        migrations = [
+            ("option_trades", "orb_high",      "REAL"),
+            ("option_trades", "orb_low",       "REAL"),
+            ("option_trades", "sl_price",      "REAL"),
+            ("option_trades", "target_price",  "REAL"),   # NEW v5
+            ("option_trades", "swing_level",   "REAL"),
+            ("option_trades", "pattern",       "TEXT"),
+            ("option_trades", "exit_reason",   "TEXT"),   # NEW v5
+            ("option_trades", "current_price", "REAL"),
+            ("option_trades", "exit_price",    "REAL"),
+            ("option_trades", "pnl",           "REAL"),
+            ("option_trades", "exit_time",     "DATETIME"),
+            ("sentiment_option_trades", "avg_iv",           "REAL"),
+            ("sentiment_option_trades", "iv_rank",          "REAL"),
+            ("sentiment_option_trades", "iv_percentile",    "REAL"),
+            ("sentiment_option_trades", "gamma_flip_level", "REAL"),
+            ("sentiment_option_trades", "delta_bias_score", "REAL"),
+            ("sentiment_option_trades", "sl_points",        "REAL"),
+            ("sentiment_option_trades", "target_points",    "REAL"),
+            ("sentiment_option_trades", "trade_signal",     "TEXT"),
+        ]
         with self.lock:
             try:
                 with sqlite3.connect(self.db_path) as conn:
-                    cursor = conn.cursor()
-                    timestamp = datetime.now()
-
-                    cursor.execute("""
-                        INSERT INTO market_analysis_summary (
-                            timestamp, symbol, current_price, market_open, market_high, market_low,
-                            market_volume, market_bias, nearest_call_strike, nearest_call_last,
-                            nearest_put_strike, nearest_put_last
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        timestamp, symbol, current_price,
-                        current_data.get('open', 0), current_data.get('high', 0), current_data.get('low', 0),
-                        current_data.get('volume', 0), market_bias,
-                        nearest_call.get('strike_price', 0) if nearest_call else None,
-                        nearest_call.get('last_price', 0) if nearest_call else None,
-                        nearest_put.get('strike_price', 0) if nearest_put else None,
-                        nearest_put.get('last_price', 0) if nearest_put else None
-                    ))
-
+                    c = conn.cursor()
+                    for table, col, coltype in migrations:
+                        try:
+                            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+                            Logger.info(f"DB migration: added {table}.{col}")
+                        except sqlite3.OperationalError:
+                            pass
                     conn.commit()
             except Exception as e:
-                Logger.error(f"Failed to store market analysis summary: {e}")
+                Logger.error(f"DB migration failed: {e}")
 
-    def store_sentiment_trade(self,symbol: str,sentiment_type: str,direction: str,strike: float,token: str,entry_price: float,exit_price: float,current_index_price: float,current_data: Dict,option_analysis: Dict) -> None:
-        with self.lock:
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                        cursor = conn.cursor()
-                        timestamp = datetime.now()
-
-                        cursor.execute("""
-                        INSERT INTO sentiment_option_trades (
-                            timestamp, symbol, sentiment_type, direction, strike, token,
-                            entry_price, exit_price, current_index_price,
-
-                            market_open, market_high, market_low, market_volume,
-
-                            call_volume, put_volume, call_oi, put_oi,
-                            call_oi_change, put_oi_change,
-
-                            pcr_oi, pcr_oi_change, pcr_volume, pcr_vol_price,
-
-                            oi_sentiment, oi_change_sentiment, volume_sentiment, combined_sentiment,
-
-                            avg_iv, iv_rank, iv_percentile,
-                            gamma_flip_level, delta_bias_score,
-                            sl_points, target_points, trade_signal
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            timestamp, symbol, sentiment_type, direction, strike, token,
-                            entry_price, exit_price, current_index_price,
-
-                            current_data.get('open', 0),
-                            current_data.get('high', 0),
-                            current_data.get('low', 0),
-                            current_data.get('volume', 0),
-
-                            option_analysis.get('call_volume', 0),
-                            option_analysis.get('put_volume', 0),
-                            option_analysis.get('call_oi', 0),
-                            option_analysis.get('put_oi', 0),
-                            option_analysis.get('call_oi_change', 0),
-                            option_analysis.get('put_oi_change', 0),
-
-                            option_analysis.get('pcr_oi', 0),
-                            option_analysis.get('pcr_oi_change', 0),
-                            option_analysis.get('pcr_volume', 0),
-                            option_analysis.get('pcr_vol_price', 0),
-
-                            option_analysis.get('oi_sentiment', 'N/A'),
-                            option_analysis.get('oi_change_sentiment', 'N/A'),
-                            option_analysis.get('volume_sentiment', 'N/A'),
-                            option_analysis.get('sentiment', 'N/A'),
-
-                            option_analysis.get('avg_iv', 0),
-                            option_analysis.get('iv_rank', 0),
-                            option_analysis.get('iv_percentile', 0),
-
-                            option_analysis.get('gamma_flip_level', 0),
-                            option_analysis.get('delta_bias_score', 0),
-
-                            option_analysis.get('sl_points', 0),
-                            option_analysis.get('target_points', 0),
-                            option_analysis.get('trade_signal', None)
-                        ))
-
-
-                        conn.commit()                    
-            except Exception as e:
-                Logger.error(f"Failed to store sentiment trade: {e}")
-       
-    def store_option_chain_data(self, symbol: str, option_chain_data: List[Dict]) -> None:
-        """Store option chain data."""
+    def store_option_chain_data(self, symbol, option_chain_data):
         if not option_chain_data:
             return
-            
         with self.lock:
             try:
                 with sqlite3.connect(self.db_path) as conn:
-                    cursor = conn.cursor()
-                    timestamp = datetime.now()
-                    
-                    for option in option_chain_data:
-                        cursor.execute("""
-                            INSERT INTO option_chain_data (
-                                timestamp, symbol, strike_price, option_type,
-                                last_price, bid, ask, volume, open_interest, 
-                                change_in_oi, implied_volatility
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            timestamp, symbol, option.get('strike_price', 0),
-                            option.get('option_type', ''), option.get('last_price', 0),
-                            option.get('bid', 0), option.get('ask', 0),
-                            option.get('volume', 0), option.get('open_interest', 0),
-                            option.get('change_in_oi', 0), option.get('implied_volatility', 0)
-                        ))
-                    
+                    c = conn.cursor()
+                    ts = datetime.now()
+                    for opt in option_chain_data:
+                        c.execute("""INSERT INTO option_chain_data (
+                            timestamp, symbol, strike_price, option_type,
+                            last_price, bid, ask, volume, open_interest,
+                            change_in_oi, implied_volatility)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                            (ts, symbol,
+                             opt.get('strike_price', 0), opt.get('option_type', ''),
+                             opt.get('last_price', 0), opt.get('bid', 0), opt.get('ask', 0),
+                             opt.get('volume', 0), opt.get('open_interest', 0),
+                             opt.get('change_in_oi', 0), opt.get('implied_volatility', 0)))
                     conn.commit()
-                    # Logger.success(f"Stored {len(option_chain_data)} option chain records for {symbol}")
-                    
             except Exception as e:
-                Logger.error(f"Failed to store option chain data: {e}")
-    
-    def store_market_data(self, symbol: str, market_data: Dict) -> None:
-        """Store market data."""
-        with self.lock:
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    cursor = conn.cursor()
-                    timestamp = datetime.now()
-                    
-                    cursor.execute("""
-                        INSERT INTO market_data (
-                            timestamp, symbol, open_price, high, low, close, volume
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        timestamp, symbol, market_data.get('open', 0),
-                        market_data.get('high', 0), market_data.get('low', 0),
-                        market_data.get('close', 0), market_data.get('volume', 0)
-                    ))
-                    
-                    conn.commit()
-                    
-            except Exception as e:
-                Logger.error(f"Failed to store market data: {e}")
+                Logger.error(f"Store option chain failed: {e}")
 
-    def store_delta_oi_trade(
-        self,
-        symbol: str,
-        trade_side: str,
-        oi_sentiment: str,
-        entry_price: float,
-        current_price: float,
-        exit_price: float,
-        pcr_oi: float,
-        delta_bias_score: float,
-        gamma_flip_level: float,
-        status: str
-    ):
+    def store_market_data(self, symbol, market_data):
         with self.lock:
             try:
                 with sqlite3.connect(self.db_path) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        INSERT INTO delta_oi_trades (
-                            symbol, trade_side, oi_sentiment,
-                            entry_price, current_price, exit_price,
-                            pcr_oi, delta_bias_score, gamma_flip_level,
-                            status
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        symbol,
-                        trade_side,
-                        oi_sentiment,
-                        entry_price,
-                        current_price,
-                        exit_price,
-                        pcr_oi,
-                        delta_bias_score,
-                        gamma_flip_level,
-                        status
-                    ))
+                    conn.execute("""INSERT INTO market_data
+                        (timestamp, symbol, open_price, high, low, close, volume)
+                        VALUES (?,?,?,?,?,?,?)""",
+                        (datetime.now(), symbol,
+                         market_data.get('open', 0), market_data.get('high', 0),
+                         market_data.get('low', 0), market_data.get('close', 0),
+                         market_data.get('volume', 0)))
                     conn.commit()
             except Exception as e:
-                Logger.error(f"Failed to store delta OI trade: {e}")
-
+                Logger.error(f"Store market data failed: {e}")
 
     def insert_trade(self, **data):
-        with sqlite3.connect(self.db_path) as con:
-            cur = con.cursor()
-            cur.execute("""
-                INSERT INTO option_trades (
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                c = conn.cursor()
+                c.execute("""INSERT INTO option_trades (
                     symbol, strategy, option_type, strike, token,
-                    qty, entry_price, status,
-                    entry_oi, entry_delta, entry_time
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                data["symbol"], data["strategy"], data["option_type"],
-                data["strike"], data["token"],
-                data["qty"], data["entry_price"],
-                "OPEN", data["entry_oi"], data["entry_delta"],
-                datetime.now().isoformat()
-            ))
-            return cur.lastrowid
+                    qty, entry_price, status, entry_oi, entry_delta,
+                    orb_high, orb_low,
+                    sl_price, target_price,
+                    swing_level, pattern,
+                    entry_time)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (data["symbol"], data["strategy"], data["option_type"],
+                     data["strike"], data["token"],
+                     data["qty"], data["entry_price"],
+                     "OPEN", data["entry_oi"], data["entry_delta"],
+                     data.get("orb_high"), data.get("orb_low"),
+                     data.get("sl_price"), data.get("target_price"),
+                     data.get("swing_level"), data.get("pattern"),
+                     datetime.now().isoformat()))
+                return c.lastrowid
 
+    def close_trade(self, trade_id, exit_price, pnl, exit_reason="SIGNAL_EXIT"):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""UPDATE option_trades SET
+                    exit_price=?, pnl=?, status='CLOSED',
+                    exit_reason=?, exit_time=?
+                    WHERE id=?""",
+                    (exit_price, pnl, exit_reason,
+                     datetime.now().isoformat(), trade_id))
 
-    def close_trade(self, trade_id, exit_price, pnl):
-        with sqlite3.connect(self.db_path) as con:
-            con.execute("""
-                UPDATE option_trades SET
-                    exit_price=?,
-                    pnl=?,
-                    status='CLOSED',
-                    exit_time=?
-                WHERE id=?
-            """, (exit_price, pnl, datetime.now().isoformat(), trade_id))
+    def restore_open_trades(self) -> Dict[str, Any]:
+        """
+        On startup, reload every OPEN trade from the DB and rebuild
+        CONFIG.oi_state so the system continues monitoring / exiting them.
+
+        Returns a summary dict  {symbol: {"CE": count, "PE": count}}
+        """
+        ALL_STRATEGIES = ["S1","S2","S3","S4","S5","S6","S7","S8"]
+
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    rows = conn.execute(
+                        "SELECT * FROM option_trades WHERE status='OPEN' ORDER BY entry_time ASC"
+                    ).fetchall()
+            except Exception as e:
+                Logger.error(f"restore_open_trades DB read failed: {e}")
+                return {}
+
+        summary: Dict[str, Any] = {}
+
+        for row in rows:
+            symbol   = row["symbol"]
+            strategy = row["strategy"]
+            opt_type = row["option_type"]  # "CE" or "PE"
+
+            if not symbol or not strategy or not opt_type:
+                continue
+            if strategy not in ALL_STRATEGIES:
+                continue
+
+            # ── Ensure CONFIG.oi_state structure exists ──────────────────
+            if symbol not in CONFIG.oi_state:
+                CONFIG.oi_state[symbol] = {
+                    "bullish": False, "bearish": False,
+                    "trades": {s: {"CE": new_trade_state(), "PE": new_trade_state()}
+                               for s in ALL_STRATEGIES}
+                }
+            for s in ALL_STRATEGIES:
+                if s not in CONFIG.oi_state[symbol]["trades"]:
+                    CONFIG.oi_state[symbol]["trades"][s] = {
+                        "CE": new_trade_state(), "PE": new_trade_state()
+                    }
+
+            trade_state = CONFIG.oi_state[symbol]["trades"][strategy][opt_type]
+
+            # ── Only restore if no active trade already in memory ─────────
+            if trade_state["active"]:
+                Logger.warning(
+                    f"[RESTORE] {symbol} {strategy} {opt_type} already active in memory — skipping"
+                )
+                continue
+
+            # ── Rebuild trade state from DB row ──────────────────────────
+            trade_state.update({
+                "active":       True,
+                "trade_id":     row["id"],
+                "strike":       row["strike"],
+                "token":        row["token"],
+                "symbol":       row["symbol"],
+                "entry_price":  row["entry_price"],
+                "qty":          row["qty"],
+                "entry_oi":     row["entry_oi"],
+                "entry_delta":  row["entry_delta"],
+                "sl_price":     row["sl_price"],
+                "target_price": row["target_price"],
+                "orb_high":     row["orb_high"],
+                "orb_low":      row["orb_low"],
+                "swing_level":  row["swing_level"],
+                "pattern":      row["pattern"],
+            })
+
+            # ── Summary ──────────────────────────────────────────────────
+            sym_summary = summary.setdefault(symbol, {})
+            key = f"{strategy}_{opt_type}"
+            sym_summary[key] = {
+                "trade_id":    row["id"],
+                "strike":      row["strike"],
+                "entry_price": row["entry_price"],
+                "sl_price":    row["sl_price"],
+                "target_price":row["target_price"],
+                "entry_time":  row["entry_time"],
+            }
+
+            Logger.info(
+                f"[RESTORE] ✅ {symbol} {strategy} {opt_type} "
+                f"| Strike:{row['strike']} | Entry:₹{row['entry_price']} "
+                f"| SL:₹{row['sl_price']} | TGT:₹{row['target_price']} "
+                f"| ID:{row['id']}"
+            )
+
+        total = sum(len(v) for v in summary.values())
+        if total:
+            Logger.success(f"[RESTORE] Restored {total} open trade(s) across {len(summary)} symbol(s)")
+        else:
+            Logger.info("[RESTORE] No open trades found in DB — starting fresh")
+
+        return summary
+
+    def store_market_analysis_summary(self, symbol, current_price, current_data,
+                                       market_bias, nearest_call, nearest_put):
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute("""INSERT INTO market_analysis_summary (
+                        timestamp, symbol, current_price,
+                        market_open, market_high, market_low, market_volume, market_bias,
+                        nearest_call_strike, nearest_call_last,
+                        nearest_put_strike, nearest_put_last)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (datetime.now(), symbol, current_price,
+                         current_data.get('open', 0), current_data.get('high', 0),
+                         current_data.get('low', 0), current_data.get('volume', 0), market_bias,
+                         nearest_call.get('strike_price', 0) if nearest_call else None,
+                         nearest_call.get('last_price', 0)   if nearest_call else None,
+                         nearest_put.get('strike_price', 0)  if nearest_put  else None,
+                         nearest_put.get('last_price', 0)    if nearest_put  else None))
+                    conn.commit()
+            except Exception as e:
+                Logger.error(f"store_market_analysis_summary failed: {e}")
+
+    def store_sentiment_trade(self, symbol, sentiment_type, direction, strike, token,
+                               entry_price, exit_price, current_index_price,
+                               current_data, option_analysis):
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute("""INSERT INTO sentiment_option_trades (
+                        timestamp, symbol, sentiment_type, direction, strike, token,
+                        entry_price, exit_price, current_index_price,
+                        market_open, market_high, market_low, market_volume,
+                        call_volume, put_volume, call_oi, put_oi,
+                        call_oi_change, put_oi_change,
+                        pcr_oi, pcr_oi_change, pcr_volume, pcr_vol_price,
+                        oi_sentiment, oi_change_sentiment, volume_sentiment, combined_sentiment,
+                        avg_iv, iv_rank, iv_percentile,
+                        gamma_flip_level, delta_bias_score,
+                        sl_points, target_points, trade_signal)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (datetime.now(), symbol, sentiment_type, direction, strike, token,
+                         entry_price, exit_price, current_index_price,
+                         current_data.get('open', 0), current_data.get('high', 0),
+                         current_data.get('low', 0), current_data.get('volume', 0),
+                         option_analysis.get('call_volume', 0), option_analysis.get('put_volume', 0),
+                         option_analysis.get('call_oi', 0), option_analysis.get('put_oi', 0),
+                         option_analysis.get('call_oi_change', 0), option_analysis.get('put_oi_change', 0),
+                         option_analysis.get('pcr_oi', 0), option_analysis.get('pcr_oi_change', 0),
+                         option_analysis.get('pcr_volume', 0), option_analysis.get('pcr_vol_price', 0),
+                         option_analysis.get('oi_sentiment', 'N/A'),
+                         option_analysis.get('oi_change_sentiment', 'N/A'),
+                         option_analysis.get('volume_sentiment', 'N/A'),
+                         option_analysis.get('sentiment', 'N/A'),
+                         option_analysis.get('avg_iv', 0), option_analysis.get('iv_rank', 0),
+                         option_analysis.get('iv_percentile', 0),
+                         option_analysis.get('gamma_flip_level', 0),
+                         option_analysis.get('delta_bias_score', 0),
+                         option_analysis.get('sl_points', 0), option_analysis.get('target_points', 0),
+                         option_analysis.get('trade_signal', None)))
+                    conn.commit()
+            except Exception as e:
+                Logger.error(f"store_sentiment_trade failed: {e}")
+
+    def store_delta_oi_trade(self, symbol, trade_side, oi_sentiment,
+                              entry_price, current_price, exit_price,
+                              pcr_oi, delta_bias_score, gamma_flip_level, status):
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute("""INSERT INTO delta_oi_trades (
+                        symbol, trade_side, oi_sentiment,
+                        entry_price, current_price, exit_price,
+                        pcr_oi, delta_bias_score, gamma_flip_level, status)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (symbol, trade_side, oi_sentiment, entry_price, current_price,
+                         exit_price, pcr_oi, delta_bias_score, gamma_flip_level, status))
+                    conn.commit()
+            except Exception as e:
+                Logger.error(f"store_delta_oi_trade failed: {e}")
 
 # ===============================
 # API CLIENT
 # ===============================
 
 class APIClient:
-    """Handles API client initialization and data fetching."""
-    
-    def __init__(self, credentials_path: Optional[str] = None):
+    def __init__(self, credentials_path=None):
         self.client: Optional[FivePaisaClient] = None
         self.credentials_path = credentials_path
         self._scrips_cache: Optional[pd.DataFrame] = None
         self._open_fix_state: Dict[str, bool] = {}
-        self._daily_open_cache: Dict[str, bool] = {}
+        self._daily_open_cache: Dict[str, Any] = {}
 
-    def _load_credentials(self) -> dict:
-
-        # ✅ LOCAL FILE MODE
+    def _load_credentials(self):
         if self.credentials_path and os.path.exists(self.credentials_path):
             with open(self.credentials_path, "r") as f:
                 cred = json.load(f)
-
-        # ✅ ENV / GITHUB ACTIONS MODE
         else:
             cred = {
-                "CLIENT_CODE": os.getenv("CLIENT_CODE"),
-                "PIN": os.getenv("PIN"),
-                "TOTP_SECRET": os.getenv("TOTP_SECRET"),
-                "APP_NAME": os.getenv("APP_NAME"),
-                "APP_SOURCE": os.getenv("APP_SOURCE"),
-                "USER_ID": os.getenv("USER_ID"),
-                "PASSWORD": os.getenv("PASSWORD"),
+                "CLIENT_CODE":    os.getenv("CLIENT_CODE"),
+                "PIN":            os.getenv("PIN"),
+                "TOTP_SECRET":    os.getenv("TOTP_SECRET"),
+                "APP_NAME":       os.getenv("APP_NAME"),
+                "APP_SOURCE":     os.getenv("APP_SOURCE"),
+                "USER_ID":        os.getenv("USER_ID"),
+                "PASSWORD":       os.getenv("PASSWORD"),
                 "ENCRYPTION_KEY": os.getenv("ENCRYPTION_KEY"),
-                "USER_KEY": os.getenv("USER_KEY")
+                "USER_KEY":       os.getenv("USER_KEY")
             }
-
-        # ✅ VALIDATION (MANDATORY)
         missing = [k for k, v in cred.items() if not v]
         if missing:
-            raise RuntimeError(f"Missing 5Paisa credentials: {missing}")
-
+            raise RuntimeError(f"Missing credentials: {missing}")
         return cred
-    def initialize_client(self) -> bool:
-        """Initialize 5Paisa client with TOTP authentication."""
-        
+
+    def initialize_client(self):
         try:
             cred = self._load_credentials()
-            
             client = FivePaisaClient(cred=cred)
             totp = pyotp.TOTP(cred["TOTP_SECRET"])
-            
-            # Ensure TOTP timing
             remaining = 30 - (int(time.time()) % 30)
             if remaining < 5:
                 time.sleep(remaining + 1)
-            
-            current_totp = totp.now()
-            
             with SuppressPrints():
                 session = client.get_totp_session(
                     client_code=cred["CLIENT_CODE"],
-                    totp=current_totp,
+                    totp=totp.now(),
                     pin=cred["PIN"]
                 )
-            
             if session:
-                with SuppressPrints():
-                    self.client = client
-                    # Logger.success("API client initialized successfully")
-                    return True
-            else:
-                Logger.error("Failed to create session")
-                return False
-            
-        except Exception as e:
-            Logger.error(f"Failed to initialize API client: {e}")
+                self.client = client
+                return True
+            Logger.error("Failed to create session")
             return False
-    
-    def load_scrips_data(self, file_path: str = "scrips_data.json") -> Optional[pd.DataFrame]:
-        """Load scrips from cache or fetch from API."""
+        except Exception as e:
+            Logger.error(f"API init failed: {e}")
+            return False
+
+    def load_scrips_data(self, file_path="scrips_data.json"):
         if self._scrips_cache is not None:
             return self._scrips_cache
-            
         try:
-            # Try loading from cache first
             if os.path.exists(file_path):
                 with open(file_path, 'r') as f:
-                    scrips_data = json.load(f)
-                self._scrips_cache = pd.DataFrame(scrips_data)
-                # Logger.success(f"Loaded {len(self._scrips_cache)} scrips from cache")
+                    self._scrips_cache = pd.DataFrame(json.load(f))
                 return self._scrips_cache
-            
-            # Fetch from API if no cache
             if not self.client:
-                # Logger.error("API client not initialized")
                 return None
-                
             with SuppressPrints():
                 scrips_live = self.client.get_scrips()
-            
             if scrips_live is not None and not scrips_live.empty:
                 scrips_live.to_json(file_path, orient='records', indent=4)
                 self._scrips_cache = scrips_live
-                # Logger.success(f"Fetched {len(scrips_live)} scrips from API")
                 return scrips_live
-                
         except Exception as e:
-            Logger.error(f"Failed to load scrips data: {e}")
-            
+            Logger.error(f"Load scrips failed: {e}")
         return None
-    
-    def find_scrip_info(self, symbol: Union[str, int]) -> Optional[pd.Series]:
 
+    def find_scrip_info(self, symbol):
         scrips_df = self.load_scrips_data()
-
-        if scrips_df is None:
-            Logger.error("❌ Scrips data is None (API/cache issue)")
+        if scrips_df is None or scrips_df.empty:
             return None
-
-        if scrips_df.empty:
-            Logger.error("❌ Scrips DataFrame is empty")
-            return None
-
-          # ✅ IMPORTANT FIX: normalize ScripCode column to string
         scrips_df['ScripCode'] = scrips_df['ScripCode'].astype(str)
-
-        # ===============================
-        # CASE 1: Numeric → ScripCode lookup
-        # ===============================
         if isinstance(symbol, int) or str(symbol).isdigit():
-            scrip_code = str(symbol)
-
-            match = scrips_df[scrips_df['ScripCode'] == scrip_code]
-
+            match = scrips_df[scrips_df['ScripCode'] == str(symbol)]
             if not match.empty:
                 return match.iloc[0]
-            else:
-                Logger.warning(f"⚠️ No match found for ScripCode: {scrip_code}")
-
-        # ===============================
-        # CASE 2: Symbol lookup
-        # ===============================
         symbol_upper = str(symbol).upper()
-
         for exch in ['N', 'B']:
             for exch_type in ['I', 'C', 'D']:
                 match = scrips_df[
@@ -708,357 +648,167 @@ class APIClient:
                     (scrips_df['Exch'] == exch) &
                     (scrips_df['ExchType'] == exch_type)
                 ]
-
                 if not match.empty:
                     return match.iloc[0]
-
-        # ===============================
-        # FINAL FAIL
-        # ===============================
-        Logger.error(f"❌ Scrip info not found for: {symbol}")
-
-        # 🔥 DEBUG: show similar names (VERY useful)
-        similar = scrips_df[
-            scrips_df['Name'].str.contains(symbol_upper[:4], case=False, na=False)
-        ]['Name'].unique()[:5]
-
-        if len(similar) > 0:
-            Logger.info(f"🔁 Similar symbols found: {list(similar)}")
-
+        Logger.error(f"Scrip not found: {symbol}")
         return None
-    
 
-    def get_current_price(self, symbol: str) -> Optional[Dict[str, float]]:
-        """Get current market price and OHLC data for a symbol."""
+    def get_current_price(self, symbol):
         scrip_info = self.find_scrip_info(symbol)
         if scrip_info is None:
-            Logger.error(f"Scrip info not found for {symbol}")
             return None
-
         try:
-            req_list = [{
-                "Exch": scrip_info['Exch'],
-                "ExchType": scrip_info['ExchType'],
-                "ScripCode": int(scrip_info['ScripCode'])
-            }]
-
+            req_list = [{"Exch": scrip_info['Exch'],
+                         "ExchType": scrip_info['ExchType'],
+                         "ScripCode": int(scrip_info['ScripCode'])}]
             with SuppressPrints():
                 market_data = self.client.fetch_market_feed_scrip(req_list)
-
             if market_data and 'Data' in market_data and len(market_data['Data']) > 0:
-                price_data = market_data['Data'][0]
-
-                # -------------------------------
-                # TIME CHECK (IST assumed system time)
-                # -------------------------------
+                pd_ = market_data['Data'][0]
+                ltp = float(pd_.get('LastRate', 0))
                 now = datetime.now()
                 after_914 = (now.hour > 9) or (now.hour == 9 and now.minute >= 14)
                 today_key = f"{symbol}_{now.date()}"
-                ltp = float(price_data.get('LastRate', 0))
-                raw_open = float(price_data.get('LastRate', 0))
-
-                # -------------------------------
-                # FIX OPEN ONLY ONCE PER DAY
-                # -------------------------------
-                if (
-                    after_914
-                    and not self._open_fix_state.get(today_key)
-                    and ltp > 0
-                ):
+                if after_914 and not self._open_fix_state.get(today_key) and ltp > 0:
                     open_price = ltp
                     self._open_fix_state[today_key] = True
                 else:
-                    open_price = float(raw_open or 0)
-                
-
-
+                    open_price = float(pd_.get('LastRate', 0))
                 return {
                     'open': open_price,
-                    'high': float(price_data.get('High', 0)),
-                    'low': float(price_data.get('Low', 0)),
+                    'high': float(pd_.get('High', 0)),
+                    'low': float(pd_.get('Low', 0)),
                     'close': ltp,
-                    'pclose': float(price_data.get('PClose', 0)),
-                    'volume': int(price_data.get('Volume', 0)),
+                    'pclose': float(pd_.get('PClose', 0)),
+                    'volume': int(pd_.get('Volume', 0)),
                     'ltp': ltp,
-                    'Exch': price_data.get('Exch', 'N')
+                    'Exch': pd_.get('Exch', 'N')
                 }
-
-            else:
-                Logger.error(f"No market data received for {symbol}")
-
         except Exception as e:
-            Logger.error(f"Failed to get price for {symbol}: {e}")
-
+            Logger.error(f"get_current_price failed for {symbol}: {e}")
         return None
 
-    from datetime import datetime
-
-    # def get_current_price(self, symbol: str):
-    #     """Get current market price and OHLC data for a symbol."""
-    #     scrip_info = self.find_scrip_info(symbol)
-    #     if scrip_info is None:
-    #         Logger.error(f"Scrip info not found for {symbol}")
-    #         return None
-
-    #     try:
-    #         req_list = [{
-    #             "Exch": scrip_info['Exch'],
-    #             "ExchType": scrip_info['ExchType'],
-    #             "ScripCode": int(scrip_info['ScripCode'])
-    #         }]
-
-    #         with SuppressPrints():
-    #             market_data = self.client.fetch_market_feed_scrip(req_list)
-
-    #         if not market_data or 'Data' not in market_data or not market_data['Data']:
-    #             Logger.error(f"No market data received for {symbol}")
-    #             return None
-
-    #         price_data = market_data['Data'][0]
-    #         ltp = float(price_data.get('LastRate', 0))
-
-    #         # --------------------------------
-    #         # DAILY OPEN — FETCH ONLY ONCE
-    #         # --------------------------------
-    #         today = datetime.now().date()
-    #         open_key = f"{symbol}_{today}"
-
-    #         if open_key not in self._daily_open_cache:
-    #             historical_1d = self.fetch_historical_data(
-    #                 symbol,
-    #                 mins="1d",
-    #                 days_back=1
-    #             )
-
-    #             open_price = ltp
-
-    #             # ✅ DATAFRAME SAFE CHECK
-    #             if historical_1d is not None and not historical_1d.empty:
-    #                 # Assumes columns: ['open','high','low','close','volume']
-    #                 open_price = float(historical_1d.iloc[0]["Open"])
-
-    #             self._daily_open_cache[open_key] = open_price
-
-    #         else:
-    #             open_price = self._daily_open_cache[open_key]
-
-    #         return {
-    #             "open": open_price,                     # ✅ cached daily open
-    #             "high": float(price_data.get("High", 0)),
-    #             "low": float(price_data.get("Low", 0)),
-    #             "close": ltp,
-    #             "pclose": float(price_data.get("PClose", 0)),
-    #             "volume": int(price_data.get("Volume", 0)),
-    #             "ltp": ltp,
-    #             "Exch": price_data.get("Exch", "N"),
-    #         }
-
-    #     except Exception as e:
-    #         Logger.error(f"Failed to get price for {symbol}: {e}")
-
-    #     return None
-
-    def is_trading_time(self) -> bool:
-        """
-        Returns True if current time is within NSE trading hours
-        (Mon–Fri, 09:15–15:30)
-        """
+    def is_trading_time(self):
         now = datetime.now()
-
-        # Weekend check
-        # if now.weekday() >= 5:  # 5=Saturday, 6=Sunday
-        #     return False
-        market_open = dtime(9, 28)
-        market_close = dtime(22, 30)
-        return market_open <= now.time() <= market_close
+        return dtime(9, 28) <= now.time() <= dtime(15, 0)
 
     def is_live_entry_time(self):
-        now = datetime.now().time()
-        return dtime(9, 30) <= now <= dtime(15, 0)
+        return dtime(9, 30) <= datetime.now().time() <= dtime(15, 0)
 
     def is_force_exit_time(self):
-        now = datetime.now().time()
-        return dtime(15, 5) <= now <= dtime(15, 15)
+        return dtime(15, 5) <= datetime.now().time() <= dtime(15, 15)
 
-    def get_market_status(self) -> dict:
-        """
-        Check market status ONLY for:
-        Exch = N (NSE)
-        ExchType = C (Cash)
-        """
-
-        market_status = {
-            "is_open": False,
-            "message": "Market is closed"
-        }
-
-        # Call 5paisa SDK
-        market_status_api = self.client.get_market_status()
-
-        # SDK returns a LIST of exchange statuses
-        for exch in market_status_api:
-            if exch.get("Exch") == "N" and exch.get("ExchType") == "C":
-                if exch.get("MarketStatus") == "Open":
-                    market_status["is_open"] = True
-                    market_status["message"] = "NSE Cash market is OPEN"
-                else:
-                    market_status["message"] = "NSE Cash market is CLOSED"
-                break
-
-        return market_status
-
-
-    def fetch_historical_data(self, symbol: str, mins: str, days_back: int = 100) -> Optional[pd.DataFrame]:
-        """Fetch historical data for a symbol."""
+    def fetch_historical_data(self, symbol, mins, days_back=100):
         scrip_info = self.find_scrip_info(symbol)
         if scrip_info is None:
-            Logger.error(f"Scrip info not found for {symbol}")
             return None
-        
         try:
-            end_date = datetime.now().strftime("%Y-%m-%d")
+            end_date   = datetime.now().strftime("%Y-%m-%d")
             start_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
             with SuppressPrints():
                 hist_data = self.client.historical_data(
                     Exch=scrip_info['Exch'],
                     ExchangeSegment=scrip_info['ExchType'],
                     ScripCode=int(scrip_info['ScripCode']),
-                    time=mins,  # 5-minute data for better analysis
+                    time=mins,
                     From=start_date,
                     To=end_date
                 )
-            
             if hist_data is not None and not hist_data.empty:
-                # Logger.success(f"Fetched {len(hist_data)} historical records for {symbol}")
                 return hist_data
-            else:
-                Logger.error(f"No historical data received for {symbol}")
-                return None
-            
         except Exception as e:
-            Logger.error(f"Failed to fetch historical data for {symbol}: {e}")
-            return None
-    
-    def get_option_chain_data(self, symbol: str) -> List[Dict]:
-        """Get option chain data from API."""
+            Logger.error(f"fetch_historical_data failed for {symbol}: {e}")
+        return None
+
+    def get_option_chain_data(self, symbol):
         if not self.client:
-            Logger.error("API client not initialized")
             return []
-            
         try:
-            # with SuppressPrints():
-                # Get expiry dates
-                scrip_info = self.find_scrip_info(symbol)
-                expiry_data = self.client.get_expiry(scrip_info['Exch'] , symbol)
-                
-                if not expiry_data or 'Expiry' not in expiry_data or not expiry_data['Expiry']:
-                    Logger.error(f"No expiry data for {symbol}")
-                    return []
-                
-                # Get nearest expiry
-                expiry_timestamp = None
-                expiry_date_str = expiry_data['Expiry'][0]['ExpiryDate']
-                
-                import re
-                match = re.search(r'/Date\((\d+)', expiry_date_str)
-                if match:
-                    expiry_timestamp = int(match.group(1))
-                
-                if not expiry_timestamp:
-                    Logger.error(f"Could not parse expiry timestamp for {symbol}")
-                    return []
-                
-                # Get option chain
-                option_chain = self.client.get_option_chain(scrip_info['Exch'] , symbol, expiry_timestamp)
-                if isinstance(option_chain, dict):
-                    for key in ['Options', 'Data', 'OptionChain']:
-                        if key in option_chain:
-                            processed_data = self._process_option_chain_data(option_chain[key],expiry_timestamp=expiry_timestamp)
-                            # Logger.success(f"Fetched option chain for {symbol}: {len(processed_data)} contracts")
-                            return processed_data
-                elif hasattr(option_chain, 'to_dict'):
-                    processed_data = self._process_option_chain_data(option_chain.to_dict('records'),expiry_timestamp=expiry_timestamp)
-                    # Logger.success(f"Fetched option chain for {symbol}: {len(processed_data)} contracts")
-                    return processed_data
-                    
+            scrip_info  = self.find_scrip_info(symbol)
+            expiry_data = self.client.get_expiry(scrip_info['Exch'], symbol)
+            if not expiry_data or 'Expiry' not in expiry_data or not expiry_data['Expiry']:
+                return []
+            expiry_date_str = expiry_data['Expiry'][0]['ExpiryDate']
+            match = re.search(r'/Date\((\d+)', expiry_date_str)
+            if not match:
+                return []
+            expiry_timestamp = int(match.group(1))
+            option_chain = self.client.get_option_chain(scrip_info['Exch'], symbol, expiry_timestamp)
+            if isinstance(option_chain, dict):
+                for key in ['Options', 'Data', 'OptionChain']:
+                    if key in option_chain:
+                        return self._process_option_chain_data(option_chain[key], expiry_timestamp)
+            elif hasattr(option_chain, 'to_dict'):
+                return self._process_option_chain_data(option_chain.to_dict('records'), expiry_timestamp)
         except Exception as e:
-            Logger.error(f"Failed to get option chain for {symbol}: {e}")
-            
+            Logger.error(f"get_option_chain_data failed for {symbol}: {e}")
         return []
-    
-    def _process_option_chain_data(self, raw_data: List[Dict],expiry_timestamp:datetime) -> List[Dict]:
-        """Process raw option chain data into standardized format."""
-        processed_data = []
-        
-        for option in raw_data:
+
+    def _process_option_chain_data(self, raw_data, expiry_timestamp):
+        processed = []
+        for opt in raw_data:
             try:
-                processed_data.append({                    
-                    'name': option.get('Name', ''),
-                    'ScripCode': int(option.get('ScripCode', 0)),
-                    'strike_price': float(option.get('StrikeRate', 0)),
-                    'option_type': option.get('CPType', ''),
-                    'last_price': float(option.get('LastRate', 0)),
-                    'bid': float(option.get('BidPrice', 0)),
-                    'ask': float(option.get('AskPrice', 0)),
-                    'volume': int(option.get('Volume', 0)),
-                    'open_interest': int(option.get('OpenInterest', 0)),
-                    'change_in_oi': int(option.get('ChangeInOI', 0)),
-                    'implied_volatility': float(option.get('IV', 0)),
-                    'expiry': expiry_timestamp
+                processed.append({
+                    'name':              opt.get('Name', ''),
+                    'ScripCode':         int(opt.get('ScripCode', 0)),
+                    'strike_price':      float(opt.get('StrikeRate', 0)),
+                    'option_type':       opt.get('CPType', ''),
+                    'last_price':        float(opt.get('LastRate', 0)),
+                    'bid':               float(opt.get('BidPrice', 0)),
+                    'ask':               float(opt.get('AskPrice', 0)),
+                    'volume':            int(opt.get('Volume', 0)),
+                    'open_interest':     int(opt.get('OpenInterest', 0)),
+                    'change_in_oi':      int(opt.get('ChangeInOI', 0)),
+                    'implied_volatility':float(opt.get('IV', 0)),
+                    'expiry':            expiry_timestamp
                 })
-            except (ValueError, TypeError) as e:
-                Logger.error(f"Error processing option data: {e}")
-                continue
-                
-        return processed_data
-    
-    def get_positions(self) -> List[Dict]:
-        """Fetch current positions using 5Paisa API client - FIXED VERSION."""
+            except Exception as e:
+                Logger.error(f"Option processing error: {e}")
+        return processed
+
+    def get_positions(self):
         if not self.client:
-            Logger.error("API client not initialized")
             return []
-            
         try:
             with SuppressPrints():
                 positions = self.client.positions()
-                        
-            if positions and isinstance(positions, list):
-                return positions
-            else:
-                return []
-                
+            return positions if positions and isinstance(positions, list) else []
         except Exception as e:
-            Logger.error(f"Failed to fetch positions: {e}")
+            Logger.error(f"get_positions failed: {e}")
             return []
 
-    def place_order_api(self, scripCode, direction, quantity, price, strike_price=None, option_type=None, exchange=None):
-        """Enhanced order placement function for 5Paisa API."""
+    def get_market_status(self) -> dict:
+        result = {"is_open": False, "message": "Market is closed"}
+        try:
+            status_list = self.client.get_market_status()
+            for exch in status_list:
+                if exch.get("Exch") == "N" and exch.get("ExchType") == "C":
+                    if exch.get("MarketStatus") == "Open":
+                        result["is_open"] = True
+                        result["message"] = "NSE Cash market is OPEN"
+                    else:
+                        result["message"] = "NSE Cash market is CLOSED"
+                    break
+        except Exception as e:
+            Logger.error(f"get_market_status failed: {e}")
+        return result
+
+    def place_order_api(self, scripCode, direction, quantity, price,
+                        strike_price=None, option_type=None, exchange=None):
         try:
             order_type = 'B' if direction.upper() == 'BUY' else 'S'
-            
-            order_response = self.client.place_order(
-                OrderType=order_type,
-                Exchange=exchange,
-                ExchangeType='D',  # Derivatives
-                ScripCode=int(scripCode),
-                Qty=quantity,
-                Price=price,
-                IsIntraday=False,  # Set to True for intraday
-                DisQty=0,
-                StopLossPrice=0,
-                IsVTD=False,
-                IOCOrder=False,
-                IsAHPlaced=exchange
+            self.client.place_order(
+                OrderType=order_type, Exchange=exchange, ExchangeType='D',
+                ScripCode=int(scripCode), Qty=quantity, Price=price,
+                IsIntraday=False, DisQty=0, StopLossPrice=0,
+                IsVTD=False, IOCOrder=False, IsAHPlaced=exchange
             )
-            
-            order_details = f"{direction} {quantity} {scripCode}"
+            detail = f"{direction} {quantity} {scripCode}"
             if strike_price and option_type:
-                order_details += f" {strike_price} {option_type}"
-            order_details += f" @ Rs.{price:.2f}"
-            
-            print(f"ORDER PLACED: {order_details}")
+                detail += f" {strike_price} {option_type}"
+            detail += f" @ Rs.{price:.2f}"
+            print(f"ORDER PLACED: {detail}")
             return True
-            
         except Exception as e:
             print(f"Order placement failed: {e}")
             return False
@@ -1068,1937 +818,1216 @@ class APIClient:
 # ===============================
 
 class TechnicalIndicators:
-    """Technical indicators calculation."""
-    
     @staticmethod
     def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
-        """Compute all technical indicators."""
         if df is None or df.empty:
             return df
-            
         df = df.copy()
-        
         try:
-            # Moving averages
-            df['SMA_5'] = ta.trend.sma_indicator(df["Close"], window=5)
-            df['SMA_10'] = ta.trend.sma_indicator(df["Close"], window=10)
-            df['SMA_20'] = ta.trend.sma_indicator(df["Close"], window=20)
-            df['EMA_9'] = ta.trend.ema_indicator(df["Close"], window=9)
-            df['EMA_21'] = ta.trend.ema_indicator(df["Close"], window=21)
-            df['EMA_50'] = ta.trend.ema_indicator(df["Close"], window=50)
-            
-            # VWAP
-            df['VWAP'] = (df['Close'] * df['Volume']).cumsum() / df['Volume'].cumsum()
-            
-            # Momentum indicators
-            df["RSI"] = ta.momentum.rsi(df["Close"], window=14)
-            df["MACD"] = ta.trend.macd_diff(df["Close"])
+            df['SMA_5']       = ta.trend.sma_indicator(df["Close"], window=5)
+            df['SMA_10']      = ta.trend.sma_indicator(df["Close"], window=10)
+            df['SMA_20']      = ta.trend.sma_indicator(df["Close"], window=20)
+            df['EMA_9']       = ta.trend.ema_indicator(df["Close"], window=9)
+            df['EMA_21']      = ta.trend.ema_indicator(df["Close"], window=21)
+            df['EMA_50']      = ta.trend.ema_indicator(df["Close"], window=50)
+            df['VWAP']        = (df['Close'] * df['Volume']).cumsum() / df['Volume'].cumsum()
+            df["RSI"]         = ta.momentum.rsi(df["Close"], window=14)
+            df["MACD"]        = ta.trend.macd_diff(df["Close"])
             df["MACD_Signal"] = ta.trend.macd_signal(df["Close"])
-            
-            # Volatility indicators
-            df["BB_High"] = ta.volatility.bollinger_hband(df["Close"], window=20, window_dev=2)
-            df["BB_Low"] = ta.volatility.bollinger_lband(df["Close"], window=20, window_dev=2)
-            df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
-            
-            # Stochastic
-            df['Stoch_K'] = ta.momentum.stoch(df['High'], df['Low'], df['Close'], window=14)
-            df['Stoch_D'] = ta.momentum.stoch_signal(df['High'], df['Low'], df['Close'], window=14)
-            
-            # Williams %R
-            df['Williams_R'] = ta.momentum.williams_r(df['High'], df['Low'], df['Close'], lbp=14)
-            
+            df["BB_High"]     = ta.volatility.bollinger_hband(df["Close"], window=20, window_dev=2)
+            df["BB_Low"]      = ta.volatility.bollinger_lband(df["Close"], window=20, window_dev=2)
+            df['ATR']         = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
+            df['Stoch_K']     = ta.momentum.stoch(df['High'], df['Low'], df['Close'], window=14)
+            df['Stoch_D']     = ta.momentum.stoch_signal(df['High'], df['Low'], df['Close'], window=14)
+            df['Williams_R']  = ta.momentum.williams_r(df['High'], df['Low'], df['Close'], lbp=14)
         except Exception as e:
-            Logger.error(f"Error computing technical indicators: {e}")
-            
+            Logger.error(f"Indicator compute error: {e}")
         return df
 
 # ===============================
-# MARKET ANALYSIS
+# CANDLESTICK PATTERN DETECTOR  (S8)
 # ===============================
-from collections import deque
-from statistics import mean
-from typing import List, Dict, Any
-import math
-from datetime import datetime
-from scipy.stats import norm
+
+class CandlestickPatterns:
+    @staticmethod
+    def _body(c):   return abs(c['Close'] - c['Open'])
+    @staticmethod
+    def _range(c):  return c['High'] - c['Low']
+    @staticmethod
+    def _upper_wick(c): return c['High'] - max(c['Close'], c['Open'])
+    @staticmethod
+    def _lower_wick(c): return min(c['Close'], c['Open']) - c['Low']
+    @staticmethod
+    def _is_bullish(c): return c['Close'] > c['Open']
+    @staticmethod
+    def _is_bearish(c): return c['Close'] < c['Open']
+
+    @staticmethod
+    def hammer(c) -> bool:
+        body=CandlestickPatterns._body(c); lwick=CandlestickPatterns._lower_wick(c)
+        uwick=CandlestickPatterns._upper_wick(c); rng=CandlestickPatterns._range(c)
+        if rng==0 or body==0: return False
+        return lwick>=2*body and uwick<=0.3*body and body<=0.35*rng
+
+    @staticmethod
+    def dragonfly_doji(c) -> bool:
+        body=CandlestickPatterns._body(c); lwick=CandlestickPatterns._lower_wick(c)
+        rng=CandlestickPatterns._range(c)
+        if rng==0: return False
+        return body<=0.05*rng and lwick>=0.6*rng
+
+    @staticmethod
+    def bullish_engulfing(prev, curr) -> bool:
+        return (CandlestickPatterns._is_bearish(prev) and CandlestickPatterns._is_bullish(curr) and
+                curr['Open']<=prev['Close'] and curr['Close']>=prev['Open'])
+
+    @staticmethod
+    def morning_star(c1, c2, c3) -> bool:
+        b1=CandlestickPatterns._body(c1); b2=CandlestickPatterns._body(c2); b3=CandlestickPatterns._body(c3)
+        return (CandlestickPatterns._is_bearish(c1) and b1>0 and b2<=0.3*b1 and
+                CandlestickPatterns._is_bullish(c3) and b3>=0.5*b1 and
+                c3['Close']>(c1['Open']+c1['Close'])/2)
+
+    @staticmethod
+    def piercing_line(prev, curr) -> bool:
+        mid=(prev['Open']+prev['Close'])/2
+        return (CandlestickPatterns._is_bearish(prev) and CandlestickPatterns._is_bullish(curr) and
+                curr['Open']<prev['Low'] and curr['Close']>mid and curr['Close']<prev['Open'])
+
+    @staticmethod
+    def shooting_star(c) -> bool:
+        body=CandlestickPatterns._body(c); uwick=CandlestickPatterns._upper_wick(c)
+        lwick=CandlestickPatterns._lower_wick(c); rng=CandlestickPatterns._range(c)
+        if rng==0 or body==0: return False
+        return uwick>=2*body and lwick<=0.3*body and body<=0.35*rng
+
+    @staticmethod
+    def gravestone_doji(c) -> bool:
+        body=CandlestickPatterns._body(c); uwick=CandlestickPatterns._upper_wick(c)
+        rng=CandlestickPatterns._range(c)
+        if rng==0: return False
+        return body<=0.05*rng and uwick>=0.6*rng
+
+    @staticmethod
+    def bearish_engulfing(prev, curr) -> bool:
+        return (CandlestickPatterns._is_bullish(prev) and CandlestickPatterns._is_bearish(curr) and
+                curr['Open']>=prev['Close'] and curr['Close']<=prev['Open'])
+
+    @staticmethod
+    def evening_star(c1, c2, c3) -> bool:
+        b1=CandlestickPatterns._body(c1); b2=CandlestickPatterns._body(c2); b3=CandlestickPatterns._body(c3)
+        return (CandlestickPatterns._is_bullish(c1) and b1>0 and b2<=0.3*b1 and
+                CandlestickPatterns._is_bearish(c3) and b3>=0.5*b1 and
+                c3['Close']<(c1['Open']+c1['Close'])/2)
+
+    @staticmethod
+    def dark_cloud_cover(prev, curr) -> bool:
+        mid=(prev['Open']+prev['Close'])/2
+        return (CandlestickPatterns._is_bullish(prev) and CandlestickPatterns._is_bearish(curr) and
+                curr['Open']>prev['High'] and curr['Close']<mid and curr['Close']>prev['Open'])
+
+    @staticmethod
+    def detect_bullish_pattern(df: pd.DataFrame) -> Optional[str]:
+        if len(df)<3: return None
+        c1,c2,c3 = df.iloc[-3],df.iloc[-2],df.iloc[-1]
+        if CandlestickPatterns.morning_star(c1,c2,c3):    return "MORNING_STAR"
+        if CandlestickPatterns.bullish_engulfing(c2,c3):  return "BULLISH_ENGULFING"
+        if CandlestickPatterns.piercing_line(c2,c3):      return "PIERCING_LINE"
+        if CandlestickPatterns.hammer(c3):                return "HAMMER"
+        if CandlestickPatterns.dragonfly_doji(c3):        return "DRAGONFLY_DOJI"
+        return None
+
+    @staticmethod
+    def detect_bearish_pattern(df: pd.DataFrame) -> Optional[str]:
+        if len(df)<3: return None
+        c1,c2,c3 = df.iloc[-3],df.iloc[-2],df.iloc[-1]
+        if CandlestickPatterns.evening_star(c1,c2,c3):    return "EVENING_STAR"
+        if CandlestickPatterns.bearish_engulfing(c2,c3):  return "BEARISH_ENGULFING"
+        if CandlestickPatterns.dark_cloud_cover(c2,c3):   return "DARK_CLOUD_COVER"
+        if CandlestickPatterns.shooting_star(c3):         return "SHOOTING_STAR"
+        if CandlestickPatterns.gravestone_doji(c3):       return "GRAVESTONE_DOJI"
+        return None
+
+# ===============================
+# S8 SWING + TRENDLINE HELPER
+# ===============================
+
+class S8Helper:
+    @staticmethod
+    def get_recent_swing_highs(df, lookback=50):
+        sub=df.tail(lookback+4).iloc[:-2]; highs=[]
+        for i in range(2,len(sub)-2):
+            c=sub.iloc[i]
+            if (c['High']>sub.iloc[i-1]['High'] and c['High']>sub.iloc[i-2]['High'] and
+                    c['High']>sub.iloc[i+1]['High'] and c['High']>sub.iloc[i+2]['High']):
+                highs.append(c['High'])
+        return highs
+
+    @staticmethod
+    def get_recent_swing_lows(df, lookback=50):
+        sub=df.tail(lookback+4).iloc[:-2]; lows=[]
+        for i in range(2,len(sub)-2):
+            c=sub.iloc[i]
+            if (c['Low']<sub.iloc[i-1]['Low'] and c['Low']<sub.iloc[i-2]['Low'] and
+                    c['Low']<sub.iloc[i+1]['Low'] and c['Low']<sub.iloc[i+2]['Low']):
+                lows.append(c['Low'])
+        return lows
+
+    @staticmethod
+    def trendline_value_at_last(points):
+        if len(points)<2: return None
+        x1,y1=len(points)-2,points[-2]; x2,y2=len(points)-1,points[-1]
+        slope=(y2-y1)/max(x2-x1,1)
+        return y2+slope
+
+    @staticmethod
+    def is_trendline_broken_up(df, swing_highs):
+        if len(swing_highs)<2: return False
+        tl_val=S8Helper.trendline_value_at_last(swing_highs[-2:])
+        if tl_val is None: return False
+        return swing_highs[-1]<swing_highs[-2] and float(df.iloc[-1]['Close'])>tl_val
+
+    @staticmethod
+    def is_trendline_broken_down(df, swing_lows):
+        if len(swing_lows)<2: return False
+        tl_val=S8Helper.trendline_value_at_last(swing_lows[-2:])
+        if tl_val is None: return False
+        return swing_lows[-1]>swing_lows[-2] and float(df.iloc[-1]['Close'])<tl_val
+
+    @staticmethod
+    def nearest_swing_low_to_price(swing_lows, price, atr):
+        candidates=[l for l in swing_lows if abs(l-price)<=atr and l<price]
+        return max(candidates) if candidates else None
+
+    @staticmethod
+    def nearest_swing_high_to_price(swing_highs, price, atr):
+        candidates=[h for h in swing_highs if abs(h-price)<=atr and h>price]
+        return min(candidates) if candidates else None
+
+    @staticmethod
+    def evaluate(df, current_price, atr, oi_sentiment):
+        result={
+            "ce_signal":False,"pe_signal":False,
+            "ce_pattern":None,"pe_pattern":None,
+            "ce_swing":None,"pe_swing":None,
+            "ce_sl":None,"pe_sl":None,
+            "ce_target":None,"pe_target":None,
+            "swing_highs":[],"swing_lows":[],
+            "tl_break_up":False,"tl_break_down":False,
+        }
+        if df is None or len(df)<10: return result
+
+        swing_highs=S8Helper.get_recent_swing_highs(df)
+        swing_lows =S8Helper.get_recent_swing_lows(df)
+        result["swing_highs"]=swing_highs
+        result["swing_lows"] =swing_lows
+        atr_safe=max(atr,1.0)
+
+        tl_up=S8Helper.is_trendline_broken_up(df,swing_highs)
+        result["tl_break_up"]=tl_up
+        near_low =S8Helper.nearest_swing_low_to_price(swing_lows,current_price,atr_safe*1.5)
+        bull_pat  =CandlestickPatterns.detect_bullish_pattern(df)
+
+        if tl_up and near_low is not None and oi_sentiment=="BULLISH":
+            sl   = round(near_low - atr_safe*0.5, 2)
+            risk = current_price - sl
+            result.update({
+                "ce_signal":True,"ce_pattern":bull_pat,
+                "ce_swing":near_low,"ce_sl":sl,
+                "ce_target": round(current_price + risk*RR["S8"], 2)
+            })
+
+        tl_down=S8Helper.is_trendline_broken_down(df,swing_lows)
+        result["tl_break_down"]=tl_down
+        near_high=S8Helper.nearest_swing_high_to_price(swing_highs,current_price,atr_safe*1.5)
+        bear_pat  =CandlestickPatterns.detect_bearish_pattern(df)
+
+        if tl_down and near_high is not None and oi_sentiment=="BEARISH":
+            sl   = round(near_high + atr_safe*0.5, 2)
+            risk = sl - current_price
+            result.update({
+                "pe_signal":True,"pe_pattern":bear_pat,
+                "pe_swing":near_high,"pe_sl":sl,
+                "pe_target": round(current_price - risk*RR["S8"], 2)
+            })
+
+        return result
+
+# ===============================
+# MARKET ANALYZER
+# ===============================
+
 class MarketAnalyzer:
-    """Market analysis functions."""
-    
-    pcr_history: Dict[str,  Dict[str, Any]] = {}
+    pcr_history: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def _bs_price(S, K, T, r, sigma, option_type):
-        if T <= 0 or sigma <= 0:
-            return 0.0
-
-        d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
-        d2 = d1 - sigma * math.sqrt(T)
-
-        if option_type == "CE":
-            return S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
-        else:
-            return K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-
+        if T<=0 or sigma<=0: return 0.0
+        d1=(math.log(S/K)+(r+0.5*sigma**2)*T)/(sigma*math.sqrt(T)); d2=d1-sigma*math.sqrt(T)
+        if option_type=="CE": return S*norm.cdf(d1)-K*math.exp(-r*T)*norm.cdf(d2)
+        return K*math.exp(-r*T)*norm.cdf(-d2)-S*norm.cdf(-d1)
 
     @staticmethod
     def calculate_implied_volatility(price, S, K, T, r, option_type):
-        if price <= 0 or T <= 0:
-            return 0.0
-
-        sigma = 0.30
+        if price<=0 or T<=0: return 0.0
+        sigma=0.30
         for _ in range(50):
-            bs_price = MarketAnalyzer._bs_price(S, K, T, r, sigma, option_type)
-            d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
-            vega = S * norm.pdf(d1) * math.sqrt(T)
+            bs_price=MarketAnalyzer._bs_price(S,K,T,r,sigma,option_type)
+            d1=(math.log(S/K)+(r+0.5*sigma**2)*T)/(sigma*math.sqrt(T))
+            vega=S*norm.pdf(d1)*math.sqrt(T)
+            if vega==0: break
+            diff=bs_price-price
+            if abs(diff)<1e-4: break
+            sigma-=diff/vega; sigma=max(0.001,min(sigma,5))
+        return float(round(sigma*100,2))
 
-            if vega == 0:
-                break
-
-            diff = bs_price - price
-            if abs(diff) < 1e-4:
-                break
-
-            sigma -= diff / vega
-            sigma = max(0.001, min(sigma, 5))
-
-        return float(round(sigma * 100, 2))
-    
     @staticmethod
     def calculate_greeks(S, K, T, r, iv, option_type):
-        if T <= 0 or iv <= 0:
-            return {"delta": 0, "gamma": 0, "theta": 0, "vega": 0}
-
-        sigma = iv / 100
-        d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
-        d2 = d1 - sigma * math.sqrt(T)
-
-        delta = norm.cdf(d1) if option_type == "CE" else -norm.cdf(-d1)
-        gamma = norm.pdf(d1) / (S * sigma * math.sqrt(T))
-        vega = S * norm.pdf(d1) * math.sqrt(T) / 100
-
-        if option_type == "CE":
-            theta = (-S * norm.pdf(d1) * sigma / (2 * math.sqrt(T))
-                    - r * K * math.exp(-r * T) * norm.cdf(d2)) / 365
+        if T<=0 or iv<=0: return {"delta":0,"gamma":0,"theta":0,"vega":0}
+        sigma=iv/100
+        d1=(math.log(S/K)+(r+0.5*sigma**2)*T)/(sigma*math.sqrt(T)); d2=d1-sigma*math.sqrt(T)
+        delta=norm.cdf(d1) if option_type=="CE" else -norm.cdf(-d1)
+        gamma=norm.pdf(d1)/(S*sigma*math.sqrt(T))
+        vega=S*norm.pdf(d1)*math.sqrt(T)/100
+        if option_type=="CE":
+            theta=(-S*norm.pdf(d1)*sigma/(2*math.sqrt(T))-r*K*math.exp(-r*T)*norm.cdf(d2))/365
         else:
-            theta = (-S * norm.pdf(d1) * sigma / (2 * math.sqrt(T))
-                    + r * K * math.exp(-r * T) * norm.cdf(-d2)) / 365
-
-        return {
-            "delta": float(round(delta, 4)),
-            "gamma": float(round(gamma, 6)),
-            "theta": float(round(theta, 2)),
-            "vega": float(round(vega, 4))
-        }
-
+            theta=(-S*norm.pdf(d1)*sigma/(2*math.sqrt(T))+r*K*math.exp(-r*T)*norm.cdf(-d2))/365
+        return {"delta":float(round(delta,4)),"gamma":float(round(gamma,6)),
+                "theta":float(round(theta,2)),"vega":float(round(vega,4))}
 
     @staticmethod
-    def find_support_resistance_option_chain(
-                option_chain_data: List[Dict],
-                current_price: float,
-                pclose_price: float,
-                window: float = 800.0
-            ) -> Tuple[List[float], List[float], str]:
-                """
-                Find dynamic support and resistance levels based on
-                Option Chain Open Interest, Change in OI, and Volume.
+    def find_support_resistance_option_chain(option_chain_data, current_price, pclose_price, window=800.0):
+        if not option_chain_data: return [],[],  "No data"
+        calls=[o for o in option_chain_data if o.get("option_type")=="CE" and o.get("open_interest",0)>0]
+        puts =[o for o in option_chain_data if o.get("option_type")=="PE" and o.get("open_interest",0)>0]
+        put_cand =[o for o in puts  if pclose_price-window<=o.get("strike_price",0)<=pclose_price]
+        call_cand=[o for o in calls if pclose_price<=o.get("strike_price",0)<=pclose_price+window]
+        if not put_cand and not call_cand: return [],[],  "No strikes in window"
+        max_put_oi =max((o.get("open_interest",0) for o in put_cand), default=0)
+        max_call_oi=max((o.get("open_interest",0) for o in call_cand),default=0)
+        def strength(opt,atm,smx):
+            oi=float(opt.get("open_interest",0))
+            if smx>0 and oi<smx*0.25: return 0.0
+            chg=max(float(opt.get("change_in_oi",0)),0.0)
+            vol=float(opt.get("volume",0))
+            if oi>0: vol=min(vol,oi*2.0)
+            dist=abs(float(opt.get("strike_price",0))-atm)
+            atm_w=max(1.0,200.0/(1.0+dist))
+            return oi*0.50+chg*0.35+vol*0.10+atm_w*0.55
+        put_levels =sorted([(o.get("strike_price"),strength(o,current_price,max_put_oi))
+                             for o in put_cand  if strength(o,current_price,max_put_oi)>0],
+                            key=lambda x:x[1],reverse=True)
+        call_levels=sorted([(o.get("strike_price"),strength(o,current_price,max_call_oi))
+                             for o in call_cand if strength(o,current_price,max_call_oi)>0],
+                            key=lambda x:x[1],reverse=True)
+        supports   =[l[0] for l in put_levels[:3]]
+        resistances=[l[0] for l in call_levels[:3]]
+        ts=sum(l[1] for l in call_levels); tp=sum(l[1] for l in put_levels)
+        if tp==0 and ts==0:  bias="Neutral"
+        elif tp>=ts:         bias="🟢 Bullish Bias (Put writers dominant)"
+        else:                bias="🔴 Bearish Bias (Call writers dominant)"
+        return supports,resistances,bias
 
-                Returns:
-                    supports:    Top 3 strong PUT strikes (support)
-                    resistances: Top 3 strong CALL strikes (resistance)
-                    market_bias: Bullish / Bearish text label
-                """
-                if not option_chain_data:
-                    return [], [], "No data"
-
-                # Separate Calls and Puts with valid OI
-                calls = [opt for opt in option_chain_data
-                        if opt.get("option_type") == "CE" and opt.get("open_interest", 0) > 0]
-                puts = [opt for opt in option_chain_data
-                        if opt.get("option_type") == "PE" and opt.get("open_interest", 0) > 0]
-
-                if not calls and not puts:
-                    return [], [], "No valid OI"
-
-                # Filter by window around previous close
-                put_candidates = [
-                    opt for opt in puts
-                    if pclose_price - window <= opt.get("strike_price", 0) <= pclose_price
-                ]
-                call_candidates = [
-                    opt for opt in calls
-                    if pclose_price <= opt.get("strike_price", 0) <= pclose_price + window
-                ]
-
-                # Handle edge cases
-                if not put_candidates and not call_candidates:
-                    return [], [], "No strikes in window"
-
-                max_put_oi = max((opt.get("open_interest", 0) for opt in put_candidates), default=0)
-                max_call_oi = max((opt.get("open_interest", 0) for opt in call_candidates), default=0)
-
-                def calculate_strength(opt: Dict, atm_price: float, side_max_oi: float) -> float:
-                    """
-                    High-win-rate strength formula.
-                    Filters out weak OI, caps extreme volume, gives heavy ATM weight.
-                    """
-                    oi = float(opt.get("open_interest", 0.0))
-                    if side_max_oi > 0 and oi < side_max_oi * 0.25:
-                        return 0.0
-
-                    change_oi = float(opt.get("change_in_oi", 0.0))
-                    # Ignore unwinding
-                    if change_oi < 0:
-                        change_oi = 0.0
-
-                    volume = float(opt.get("volume", 0.0))
-                    # Cap fake/liquidity spikes
-                    if oi > 0:
-                        volume = min(volume, oi * 2.0)
-
-                    strike = float(opt.get("strike_price", 0.0))
-                    distance_from_atm = abs(strike - atm_price)
-
-                    # Dynamic ATM dominance: closer levels get big advantage
-                    atm_weight = max(1.0, 200.0 / (1.0 + distance_from_atm))
-
-                    # 🔥 PRO High Accuracy Strength Formula
-                    strength = (
-                        (oi * 0.50) +          # Writer commitment
-                        (change_oi * 0.35) +   # Fresh positioning / momentum
-                        (volume * 0.10) +      # Participation filter
-                        (atm_weight * 0.55)    # Zone dominance (proximity to ATM)
-                    )
-
-                    return strength
-
-                # Compute PUT side strengths (Support)
-                put_levels = []
-                for opt in put_candidates:
-                    strength = calculate_strength(opt, current_price, max_put_oi)
-                    if strength <= 0:
-                        continue
-                    put_levels.append((opt.get("strike_price"), strength))
-
-                put_levels.sort(key=lambda x: x[1], reverse=True)
-                supports = [level[0] for level in put_levels[:3]]
-
-                # Compute CALL side strengths (Resistance)
-                call_levels = []
-                for opt in call_candidates:
-                    strength = calculate_strength(opt, current_price, max_call_oi)
-                    if strength <= 0:
-                        continue
-                    call_levels.append((opt.get("strike_price"), strength))
-
-                call_levels.sort(key=lambda x: x[1], reverse=True)
-                resistances = [level[0] for level in call_levels[:3]]
-
-                # Bias detection
-                total_call_strength = sum(level[1] for level in call_levels)
-                total_put_strength = sum(level[1] for level in put_levels)
-
-                if total_put_strength == 0 and total_call_strength == 0:
-                    market_bias = "Neutral / No clear writers"
-                elif total_put_strength >= total_call_strength:
-                    market_bias = "🟢 Bullish Bias (Put writers dominant)"
-                else:
-                    market_bias = "🔴 Bearish Bias (Call writers dominant)"
-
-                return supports, resistances, market_bias
-    
-    
     @staticmethod
-    def analyze_option_chain(option_chain_data: List[Dict], current_price: float,
-                             pclose_price: float, symbol: str, window: float = 800) -> Dict[str, Any]:
-        
-        # ======================================================
-        # 🔐 SYMBOL-SCOPED STATE (FULL INITIALIZATION)
-        # ======================================================
-        hist = MarketAnalyzer.pcr_history.setdefault(symbol, {
-            "oi": [],
-            "oi_change": [],
-            "volume": [],
-            "iv_history": [],
-
-            "oi_sentiment": "NEUTRAL",
-            "oi_change_sentiment": "NEUTRAL",
-            "volume_sentiment": "NEUTRAL",
-            "combined_sentiment": "NEUTRAL",
-
-            "oi_trade": None,
-            "oi_strike": None,
-            "oi_token": None,
-            "oi_entry_price": None,
-
-            "oi_chg_trade": None,
-            "oi_chg_strike": None,
-            "oi_chg_token": None,
-            "oi_chg_entry_price": None,
-
-            "vol_trade": None,
-            "vol_strike": None,
-            "vol_token": None,
-            "vol_entry_price": None
+    def analyze_option_chain(option_chain_data, current_price, pclose_price, symbol):
+        hist=MarketAnalyzer.pcr_history.setdefault(symbol,{
+            "oi":[],"oi_change":[],"volume":[],"iv_history":[],
+            "oi_sentiment":"NEUTRAL","oi_change_sentiment":"NEUTRAL",
+            "volume_sentiment":"NEUTRAL","combined_sentiment":"NEUTRAL",
+            "oi_chg_trade":None,"oi_chg_strike":None,"oi_chg_token":None,"oi_chg_entry_price":None,
+            "vol_trade":None,"vol_strike":None,"vol_token":None,"vol_entry_price":None
         })
-
-        if not option_chain_data:
-            return {}
-        # ----------------------------------------------------
-        # A) DYNAMIC EXPIRY DETECTION (SAFE FOR STR / INT / DATETIME)
-        # ----------------------------------------------------
-        from datetime import datetime
+        if not option_chain_data: return {}
 
         def _parse_expiry(val):
-            if isinstance(val, datetime):
-                return val
+            if isinstance(val,datetime): return val
+            if isinstance(val,str): return datetime.strptime(val,"%Y-%m-%d")
+            if isinstance(val,(int,float)): return datetime.fromtimestamp(val/1000 if val>1e12 else val)
+            raise ValueError(f"Unsupported expiry: {val}")
 
-            if isinstance(val, str):
-                # expected format: YYYY-MM-DD
-                return datetime.strptime(val, "%Y-%m-%d")
-
-            if isinstance(val, (int, float)):
-                # detect milliseconds vs seconds
-                if val > 1e12:      # milliseconds
-                    return datetime.fromtimestamp(val / 1000)
-                else:               # seconds
-                    return datetime.fromtimestamp(val)
-
-            raise ValueError(f"Unsupported expiry format: {val}")
-
-        expiry_dates = [opt.get("expiry") for opt in option_chain_data if opt.get("expiry")]
-
+        expiry_dates=[o.get("expiry") for o in option_chain_data if o.get("expiry")]
         if expiry_dates:
-            expiry_dt = min(_parse_expiry(e) for e in expiry_dates)
-
-            # Time to expiry in YEARS (use seconds, not days)
-            T = max(
-                (expiry_dt - datetime.now()).total_seconds(),
-                60  # minimum 1 minute to avoid zero
-            ) / (365 * 24 * 60 * 60)
+            expiry_dt=min(_parse_expiry(e) for e in expiry_dates)
+            T=max((expiry_dt-datetime.now()).total_seconds(),60)/(365*24*60*60)
         else:
-            # fallback: assume weekly expiry
-            T = 5 / 365
+            T=5/365
+        r=0.06
 
-        r = 0.06  # risk-free rate (India)
-
-
-        # ----------------------------------------------------
-        # B) CALCULATE IV + GREEKS FOR EACH OPTION
-        # ----------------------------------------------------
         for opt in option_chain_data:
-            iv = MarketAnalyzer.calculate_implied_volatility(
-                opt.get("last_price", 0),
-                current_price,
-                opt.get("strike_price", 0),
-                T, r,
-                opt.get("option_type")
-            )
+            iv=MarketAnalyzer.calculate_implied_volatility(
+                opt.get("last_price",0),current_price,opt.get("strike_price",0),T,r,opt.get("option_type"))
+            greeks=MarketAnalyzer.calculate_greeks(
+                current_price,opt.get("strike_price",0),T,r,iv,opt.get("option_type"))
+            opt["implied_volatility"]=iv; opt.update(greeks)
 
-            greeks = MarketAnalyzer.calculate_greeks(
-                current_price,
-                opt.get("strike_price", 0),
-                T, r, iv,
-                opt.get("option_type")
-            )
-
-            opt["implied_volatility"] = iv
-            opt.update(greeks)
-
-        # ----------------------------------------------------
-        # C) IV RANK / PERCENTILE
-        # ----------------------------------------------------
-        iv_vals = [o["implied_volatility"] for o in option_chain_data if o["implied_volatility"] > 0]
-        avg_iv = round(sum(iv_vals) / len(iv_vals), 2) if iv_vals else 0
-
+        iv_vals=[o["implied_volatility"] for o in option_chain_data if o["implied_volatility"]>0]
+        avg_iv=round(sum(iv_vals)/len(iv_vals),2) if iv_vals else 0
         hist["iv_history"].append(avg_iv)
+        iv_min,iv_max=min(hist["iv_history"]),max(hist["iv_history"])
+        iv_rank=round(((avg_iv-iv_min)/(iv_max-iv_min))*100,2) if iv_max>iv_min else 0
+        iv_pct=round(sum(iv<=avg_iv for iv in hist["iv_history"])/len(hist["iv_history"])*100,2)
 
-        iv_min = min(hist["iv_history"])
-        iv_max = max(hist["iv_history"])
-
-        iv_rank = round(((avg_iv - iv_min) / (iv_max - iv_min)) * 100, 2) if iv_max > iv_min else 0
-        iv_percentile = round(
-            sum(iv <= avg_iv for iv in hist["iv_history"]) / len(hist["iv_history"]) * 100, 2
-        )
-
-        # ----------------------------------------------------
-        # D) GAMMA FLIP LEVEL
-        # ----------------------------------------------------
-        gamma_by_strike = {}
+        gamma_by_strike={}
         for opt in option_chain_data:
-            strike = opt.get("strike_price")
-            gamma_by_strike[strike] = gamma_by_strike.get(strike, 0) + opt.get("gamma", 0)
+            s=opt.get("strike_price"); gamma_by_strike[s]=gamma_by_strike.get(s,0)+opt.get("gamma",0)
+        gamma_flip=(min(gamma_by_strike,key=lambda k:abs(k-current_price)) if gamma_by_strike else None)
 
-        gamma_flip_level = min(
-            gamma_by_strike,
-            key=lambda k: abs(k - current_price)
-        ) if gamma_by_strike else None
+        net_delta=sum(opt.get("delta",0)*opt.get("open_interest",0) for opt in option_chain_data)
+        delta_bias_score=round(50+max(min(net_delta/1e6,50),-50),2)
+        avg_gamma=sum(o.get("gamma",0) for o in option_chain_data)/max(len(option_chain_data),1)
+        sl_points=round(max(20,current_price*avg_gamma*0.8),2)
+        target_points=round(sl_points*1.8,2)
 
-        # ----------------------------------------------------
-        # E) DELTA-NEUTRAL BIAS SCORE (0–100)
-        # ----------------------------------------------------
-        net_delta = sum(
-            opt.get("delta", 0) * opt.get("open_interest", 0)
-            for opt in option_chain_data
-        )
+        calls=[o for o in option_chain_data if o.get("option_type")=="CE"]
+        puts =[o for o in option_chain_data if o.get("option_type")=="PE"]
+        call_vol=sum(o.get("volume",0) for o in calls)
+        put_vol =sum(o.get("volume",0) for o in puts)
+        call_oi =sum(o.get("open_interest",0) for o in calls)
+        put_oi  =sum(o.get("open_interest",0) for o in puts)
+        call_oi_chg=sum(o.get("change_in_oi",0) for o in calls)
+        put_oi_chg =sum(o.get("change_in_oi",0) for o in puts)
+        call_vp=sum(o.get("volume",0)*o.get("last_price",0) for o in calls)
+        put_vp =sum(o.get("volume",0)*o.get("last_price",0) for o in puts)
 
-        delta_bias_score = round(50 + max(min(net_delta / 1e6, 50), -50), 2)
+        pcr_vol      =round(put_vol   /max(call_vol,1),2)
+        pcr_oi       =round(put_oi    /max(call_oi,1),2)
+        pcr_oi_chg   =round(put_oi_chg/max(abs(call_oi_chg),1),2)
+        pcr_vol_price=round(put_vp    /max(call_vp,1),2)
 
+        hist["oi"].append(pcr_oi); hist["oi_change"].append(pcr_oi_chg); hist["volume"].append(pcr_vol)
 
-        # ----------------------------------------------------
-        # F) GREEKS-BASED SL / TARGET
-        # ----------------------------------------------------
-        avg_gamma = sum(o.get("gamma", 0) for o in option_chain_data) / max(len(option_chain_data), 1)
+        if len(hist["oi"])>=2:
+            prev_oi=hist["oi"][-2]; prev_chg=hist["oi_change"][-2]; prev_vol=hist["volume"][-2]
+            if pcr_oi>prev_oi:        hist["oi_sentiment"]="BULLISH"
+            elif pcr_oi<prev_oi:      hist["oi_sentiment"]="BEARISH"
+            if pcr_oi_chg>prev_chg:   hist["oi_change_sentiment"]="BULLISH"
+            elif pcr_oi_chg<prev_chg: hist["oi_change_sentiment"]="BEARISH"
+            if pcr_vol>prev_vol:      hist["volume_sentiment"]="BULLISH"
+            elif pcr_vol<prev_vol:    hist["volume_sentiment"]="BEARISH"
+            bull=sum(s=="BULLISH" for s in [hist["oi_sentiment"],hist["oi_change_sentiment"],hist["volume_sentiment"]])
+            bear=sum(s=="BEARISH" for s in [hist["oi_sentiment"],hist["oi_change_sentiment"],hist["volume_sentiment"]])
+            if bull>bear:   hist["combined_sentiment"]="BULLISH"
+            elif bear>bull: hist["combined_sentiment"]="BEARISH"
 
-        sl_points = round(max(20, current_price * avg_gamma * 0.8), 2)
-        target_points = round(sl_points * 1.8, 2)
-
-        # ----------------------------------------------------
-        # 1) Separate CE / PE
-        # ----------------------------------------------------
-        calls = [opt for opt in option_chain_data if opt.get("option_type") == "CE"]
-        puts  = [opt for opt in option_chain_data if opt.get("option_type") == "PE"]
-
-        call_volume    = sum(opt.get("volume", 0) for opt in calls)
-        put_volume     = sum(opt.get("volume", 0) for opt in puts)
-
-        call_oi        = sum(opt.get("open_interest", 0) for opt in calls)
-        put_oi         = sum(opt.get("open_interest", 0) for opt in puts)
-
-        call_oi_change = sum(opt.get("change_in_oi", 0) for opt in calls)
-        put_oi_change  = sum(opt.get("change_in_oi", 0) for opt in puts)
-
-        total_call_vol_price = sum(opt.get("volume", 0) * opt.get("last_price", 0) for opt in calls)
-        total_put_vol_price  = sum(opt.get("volume", 0) * opt.get("last_price", 0) for opt in puts)
-    
-        # ----------------------------------------------------
-        # 2) Compute PCR
-        # ----------------------------------------------------
-        pcr_volume    = round(put_volume / max(call_volume, 1), 2)
-        pcr_oi        = round(put_oi / max(call_oi, 1), 2)
-        pcr_oi_change = round(put_oi_change / max(abs(call_oi_change), 1), 2)
-        pcr_vol_price = round(total_put_vol_price / max(total_call_vol_price, 1), 2)
-
-        # ----------------------------------------------------
-        # 3) History Storage
-        # ----------------------------------------------------
-        
-
-        for key in ["oi", "oi_change", "volume"]:
-            if key not in hist or not isinstance(hist[key], list):
-                hist[key] = []
-        
-        hist["oi"].append(pcr_oi)
-        hist["oi_change"].append(pcr_oi_change)
-        hist["volume"].append(pcr_volume) 
-
-        # ----------------------------------------------------
-        # 4) SEPARATE SENTIMENT CALCULATIONS
-        # ----------------------------------------------------
-
-        if len(hist["oi"]) >= 2:
-            prev_oi        = hist["oi"][-2]
-            prev_oi_change = hist["oi_change"][-2]
-            prev_volume    = hist["volume"][-2]
-
-            # -------------------------------
-            # OI SENTIMENT (LATCHED)
-            # -------------------------------
-            if pcr_oi > prev_oi:
-                hist["oi_sentiment"] = "BULLISH"
-            elif pcr_oi < prev_oi:
-                hist["oi_sentiment"] = "BEARISH"
-            # else → KEEP PREVIOUS STATE
-
-            # -------------------------------
-            # OI CHANGE SENTIMENT (LATCHED)
-            # -------------------------------
-            if pcr_oi_change > prev_oi_change:
-                hist["oi_change_sentiment"] = "BULLISH"
-            elif pcr_oi_change < prev_oi_change:
-                hist["oi_change_sentiment"] = "BEARISH"
-
-            # -------------------------------
-            # VOLUME SENTIMENT (LATCHED)
-            # -------------------------------
-            if pcr_volume > prev_volume:
-                hist["volume_sentiment"] = "BULLISH"
-            elif pcr_volume < prev_volume:
-                hist["volume_sentiment"] = "BEARISH"
-
-            # -------------------------------
-            # COMBINED SENTIMENT (MAJORITY)
-            # -------------------------------
-            bullish_count = sum(s == "BULLISH" for s in [
-                hist["oi_sentiment"],
-                hist["oi_change_sentiment"],
-                hist["volume_sentiment"]
-            ])
-
-            bearish_count = sum(s == "BEARISH" for s in [
-                hist["oi_sentiment"],
-                hist["oi_change_sentiment"],
-                hist["volume_sentiment"]
-            ])
-
-            if bullish_count > bearish_count:
-                hist["combined_sentiment"] = "BULLISH"
-            elif bearish_count > bullish_count:
-                hist["combined_sentiment"] = "BEARISH"
-            # else → KEEP PREVIOUS
-
-        # expose for return
-        oi_sentiment = hist["oi_sentiment"]
-        oi_change_sentiment = hist["oi_change_sentiment"]
-        volume_sentiment = hist["volume_sentiment"]
-        combined_sentiment = hist["combined_sentiment"]
-
-
-        # ----------------------------------------------------
-        # 5) Initialize Trade Tracking (OI, OI Change, Volume)
-        # ----------------------------------------------------
-        defaults = {
-            "oi_trade": None, "oi_strike": None, "oi_token": None, "oi_entry_price": None,
-            "oi_chg_trade": None, "oi_chg_strike": None, "oi_chg_token": None, "oi_chg_entry_price": None,
-            "vol_trade": None, "vol_strike": None, "vol_token": None, "vol_entry_price": None
-        }
-
-        for k, v in defaults.items():
-            if k not in hist:
-                hist[k] = v
-
-        # helper to get ATM option
-        def get_atm(options):
-            if not options:
-                return None
-            return min(options, key=lambda x: abs(x.get("strike_price", 0) - current_price))
-
-        # helper to get exit price based on stored token/strike
-        def get_exit_price(option_type: str, token: Any, strike: Any) -> float:
-            options = calls if option_type == "CE" else puts
-            # try match by token/ScripCode first
-            if token is not None:
-                for opt in options:
-                    if opt.get("token") == token or opt.get("ScripCode") == token:
-                        return float(opt.get("last_price", 0.0))
-            # fallback: match by strike
-            for opt in options:
-                if opt.get("strike_price") == strike:
-                    return float(opt.get("last_price", 0.0))
-            return 0.0
-
-        # These will be returned for this candle only when exit happens
-        oi_exit_price = None
-        oi_chg_exit_price = None
-        vol_exit_price = None
-
-        # ----------------------------------------------------
-        # 6) OI ENTRY / EXIT (Separate)
-        # ----------------------------------------------------
-        # if hist["oi_trade"] is None:
-        #     # ENTRY
-        #     if oi_sentiment == "BULLISH":
-        #         atm_ce = get_atm(calls)
-        #         if atm_ce:
-        #             hist["oi_trade"] = "CE"
-        #             hist["oi_strike"] = atm_ce.get("strike_price")
-        #             hist["oi_token"] = atm_ce.get("token") or atm_ce.get("ScripCode")
-        #             hist["oi_entry_price"] = atm_ce.get("last_price", 0.0)
-
-        #     elif oi_sentiment == "BEARISH":
-        #         atm_pe = get_atm(puts)
-        #         if atm_pe:
-        #             hist["oi_trade"] = "PE"
-        #             hist["oi_strike"] = atm_pe.get("strike_price")
-        #             hist["oi_token"] = atm_pe.get("token") or atm_pe.get("ScripCode")
-        #             hist["oi_entry_price"] = atm_pe.get("last_price", 0.0)
-
-        # else:
-        #     # EXIT on sentiment flip
-        #     if hist["oi_trade"] == "CE" and oi_sentiment == "BEARISH":
-        #         oi_exit_price = get_exit_price("CE", hist["oi_token"], hist["oi_strike"])
-        #         hist["oi_trade"] = None
-        #         hist["oi_strike"] = None
-        #         hist["oi_token"] = None
-        #         hist["oi_entry_price"] = None
-
-        #     elif hist["oi_trade"] == "PE" and oi_sentiment == "BULLISH":
-        #         oi_exit_price = get_exit_price("PE", hist["oi_token"], hist["oi_strike"])
-        #         hist["oi_trade"] = None
-        #         hist["oi_strike"] = None
-        #         hist["oi_token"] = None
-        #         hist["oi_entry_price"] = None
-
-        # ----------------------------------------------------
-        # 7) OI CHANGE ENTRY / EXIT (Separate)
-        # ----------------------------------------------------
-        if hist["oi_chg_trade"] is None:
-            # ENTRY
-            if oi_change_sentiment == "BULLISH":
-                atm_ce = get_atm(calls)
-                if atm_ce:
-                    hist["oi_chg_trade"] = "CE"
-                    hist["oi_chg_strike"] = atm_ce.get("strike_price")
-                    hist["oi_chg_token"] = atm_ce.get("token") or atm_ce.get("ScripCode")
-                    hist["oi_chg_entry_price"] = atm_ce.get("last_price", 0.0)
-
-            elif oi_change_sentiment == "BEARISH":
-                atm_pe = get_atm(puts)
-                if atm_pe:
-                    hist["oi_chg_trade"] = "PE"
-                    hist["oi_chg_strike"] = atm_pe.get("strike_price")
-                    hist["oi_chg_token"] = atm_pe.get("token") or atm_pe.get("ScripCode")
-                    hist["oi_chg_entry_price"] = atm_pe.get("last_price", 0.0)
-
-        else:
-            # EXIT on sentiment flip
-            if hist["oi_chg_trade"] == "CE" and oi_change_sentiment == "BEARISH":
-                oi_chg_exit_price = get_exit_price("CE", hist["oi_chg_token"], hist["oi_chg_strike"])
-                hist["oi_chg_trade"] = None
-                hist["oi_chg_strike"] = None
-                hist["oi_chg_token"] = None
-                hist["oi_chg_entry_price"] = None
-
-            elif hist["oi_chg_trade"] == "PE" and oi_change_sentiment == "BULLISH":
-                oi_chg_exit_price = get_exit_price("PE", hist["oi_chg_token"], hist["oi_chg_strike"])
-                hist["oi_chg_trade"] = None
-                hist["oi_chg_strike"] = None
-                hist["oi_chg_token"] = None
-                hist["oi_chg_entry_price"] = None
-
-        # ----------------------------------------------------
-        # 8) VOLUME ENTRY / EXIT (Separate)
-        # ----------------------------------------------------
-        if hist["vol_trade"] is None:
-            # ENTRY
-            if volume_sentiment == "BULLISH":
-                atm_ce = get_atm(calls)
-                if atm_ce:
-                    hist["vol_trade"] = "CE"
-                    hist["vol_strike"] = atm_ce.get("strike_price")
-                    hist["vol_token"] = atm_ce.get("token") or atm_ce.get("ScripCode")
-                    hist["vol_entry_price"] = atm_ce.get("last_price", 0.0)
-
-            elif volume_sentiment == "BEARISH":
-                atm_pe = get_atm(puts)
-                if atm_pe:
-                    hist["vol_trade"] = "PE"
-                    hist["vol_strike"] = atm_pe.get("strike_price")
-                    hist["vol_token"] = atm_pe.get("token") or atm_pe.get("ScripCode")
-                    hist["vol_entry_price"] = atm_pe.get("last_price", 0.0)
-
-        else:
-            # EXIT on sentiment flip
-            if hist["vol_trade"] == "CE" and volume_sentiment == "BEARISH":
-                vol_exit_price = get_exit_price("CE", hist["vol_token"], hist["vol_strike"])
-                hist["vol_trade"] = None
-                hist["vol_strike"] = None
-                hist["vol_token"] = None
-                hist["vol_entry_price"] = None
-
-            elif hist["vol_trade"] == "PE" and volume_sentiment == "BULLISH":
-                vol_exit_price = get_exit_price("PE", hist["vol_token"], hist["vol_strike"])
-                hist["vol_trade"] = None
-                hist["vol_strike"] = None
-                hist["vol_token"] = None
-                hist["vol_entry_price"] = None
-
-        
-        
-       # ----------------------------------------------------
-        # 9) Final Return
-        # ----------------------------------------------------
         return {
-            # raw aggregates
-            'call_volume': call_volume,
-            'put_volume': put_volume,
-            'call_oi': call_oi,
-            'put_oi': put_oi,
-            'call_oi_change': call_oi_change,
-            'put_oi_change': put_oi_change,
-
-            # PCR metrics
-            'pcr_volume': pcr_volume,
-            'pcr_oi': pcr_oi,
-            'pcr_oi_change': pcr_oi_change,
-            'pcr_vol_price': pcr_vol_price,
-
-            # sentiments
-            'oi_sentiment': oi_sentiment,
-            'oi_change_sentiment': oi_change_sentiment,
-            'volume_sentiment': volume_sentiment,
-            'sentiment': combined_sentiment,
-
-            # OI trade state + prices
-            'oi_trade': hist["oi_trade"],                 # CE / PE / None (after this candle)
-            'oi_strike': hist["oi_strike"],
-            'oi_token': hist["oi_token"],
-            'oi_entry_price': hist["oi_entry_price"],
-            'oi_exit_price': oi_exit_price,               # only filled on exit candle
-
-            # OI Change trade state + prices
-            'oi_change_trade': hist["oi_chg_trade"],
-            'oi_change_strike': hist["oi_chg_strike"],
-            'oi_change_token': hist["oi_chg_token"],
-            'oi_change_entry_price': hist["oi_chg_entry_price"],
-            'oi_change_exit_price': oi_chg_exit_price,    # only filled on exit candle
-
-            # Volume trade state + prices
-            'volume_trade': hist["vol_trade"],
-            'volume_strike': hist["vol_strike"],
-            'volume_token': hist["vol_token"],
-            'volume_entry_price': hist["vol_entry_price"],
-            'volume_exit_price': vol_exit_price,          # only filled on exit candle
-
-            # history for debugging / analysis
-            'history': {
-                "oi": list(hist["oi"]),
-                "oi_change": list(hist["oi_change"]),
-                "volume": list(hist["volume"])
-            },
-
-            # ---- IV & GREEKS (NEW) ----
-            'avg_iv': avg_iv,
-            'iv_rank': iv_rank,
-            'iv_percentile': iv_percentile,
-            'gamma_flip_level': gamma_flip_level,
-            'delta_bias_score': delta_bias_score,
-            'sl_points': sl_points,
-            'target_points': target_points
-
+            'call_volume':call_vol,'put_volume':put_vol,'call_oi':call_oi,'put_oi':put_oi,
+            'call_oi_change':call_oi_chg,'put_oi_change':put_oi_chg,
+            'pcr_volume':pcr_vol,'pcr_oi':pcr_oi,'pcr_oi_change':pcr_oi_chg,'pcr_vol_price':pcr_vol_price,
+            'oi_sentiment':hist["oi_sentiment"],'oi_change_sentiment':hist["oi_change_sentiment"],
+            'volume_sentiment':hist["volume_sentiment"],'sentiment':hist["combined_sentiment"],
+            'avg_iv':avg_iv,'iv_rank':iv_rank,'iv_percentile':iv_pct,
+            'gamma_flip_level':gamma_flip,'delta_bias_score':delta_bias_score,
+            'sl_points':sl_points,'target_points':target_points
         }
 
-    def find_dynamic_support_resistance(
-                option_chain_data: List[Dict],
-                current_price: float
-            ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-                """
-                Dynamically find top 3 Support and Resistance levels
-                using OI, Change in OI, and Volume.
-                Works directly with your attribute names.
-                """
-
-                # Separate Calls and Puts
-                calls = [opt for opt in option_chain_data if opt.get('option_type', '').upper() == 'CE']
-                puts = [opt for opt in option_chain_data if opt.get('option_type', '').upper() == 'PE']
-
-                # Weighted strength score (adjust weights if needed)
-                def calc_strength(opt: Dict) -> float:
-                    oi = opt.get('open_interest', 0)
-                    change_in_oi = max(opt.get('change_in_oi', 0), 0)  # ignore unwinding
-                    vol = opt.get('volume', 0)
-                    return oi * 0.6 + change_in_oi * 0.3 + vol * 0.1
-
-                # 🟢 Supports (Puts below/near current price)
-                put_strengths = [
-                    (opt.get('strike_price'), calc_strength(opt))
-                    for opt in puts if opt.get('strike_price', 0) <= current_price
-                ]
-                put_strengths.sort(key=lambda x: x[1], reverse=True)
-                supports = put_strengths[:3]
-
-                # 🔴 Resistances (Calls above/near current price)
-                call_strengths = [
-                    (opt.get('strike_price'), calc_strength(opt))
-                    for opt in calls if opt.get('strike_price', 0) >= current_price
-                ]
-                call_strengths.sort(key=lambda x: x[1], reverse=True)
-                resistances = call_strengths[:3]
-
-                return supports, resistances
     @staticmethod
-    def find_support_resistance_historical(df: pd.DataFrame, current_price: float) -> Tuple[List[float], List[float]]:
-                """Find support and resistance levels from historical price data."""
-                if df.empty:
-                    return [], []
-                
-                # Find pivot points for support and resistance from historical data
-                highs = df['High'].rolling(window=20, center=True).max()
-                lows = df['Low'].rolling(window=20, center=True).min()
-                
-                pivot_highs = df[df['High'] == highs]['High'].unique()
-                pivot_lows = df[df['Low'] == lows]['Low'].unique()
-                
-                # Filter levels with at least 2 touches
-                valid_resistances = []
-                for h in pivot_highs:
-                    touches = ((df['High'] >= h*0.999) & (df['Low'] <= h*1.001)).sum()
-                    if touches >= 5 and h > current_price:
-                        valid_resistances.append(h)
+    def find_support_resistance_historical(df, current_price):
+        if df.empty: return [],[]
+        highs=df['High'].rolling(window=20,center=True).max()
+        lows =df['Low'].rolling(window=20,center=True).min()
+        pivot_highs=df[df['High']==highs]['High'].unique()
+        pivot_lows =df[df['Low'] ==lows ]['Low'].unique()
+        resistances=[]
+        for h in pivot_highs:
+            if ((df['High']>=h*0.999)&(df['Low']<=h*1.001)).sum()>=5 and h>current_price:
+                resistances.append(h)
+        supports=[]
+        for l in pivot_lows:
+            if ((df['High']>=l*0.999)&(df['Low']<=l*1.001)).sum()>=5 and l<current_price:
+                supports.append(l)
+        return sorted(supports,reverse=True)[:10],sorted(resistances)[:10]
 
-                valid_supports = []
-                for l in pivot_lows:
-                    touches = ((df['High'] >= l*0.999) & (df['Low'] <= l*1.001)).sum()
-                    if touches >= 5 and l < current_price:
-                        valid_supports.append(l)
+    @staticmethod
+    def find_swing_points(df):
+        if df.empty or len(df)<5: return [],[]
+        swing_highs,swing_lows=[],[]
+        for i in range(4,len(df)):
+            idx=i-2
+            if (df.iloc[idx]['High']>df.iloc[idx-1]['High'] and df.iloc[idx]['High']>df.iloc[idx-2]['High'] and
+                df.iloc[idx]['High']>df.iloc[idx+1]['High'] and df.iloc[idx]['High']>df.iloc[idx+2]['High']):
+                swing_highs.append(df.iloc[idx]['High'])
+            if (df.iloc[idx]['Low']<df.iloc[idx-1]['Low'] and df.iloc[idx]['Low']<df.iloc[idx-2]['Low'] and
+                df.iloc[idx]['Low']<df.iloc[idx+1]['Low'] and df.iloc[idx]['Low']<df.iloc[idx+2]['Low']):
+                swing_lows.append(df.iloc[idx]['Low'])
+        return swing_highs,swing_lows
 
-                # Sort & pick nearest 3
-                resistances = sorted(valid_resistances)[:10]
-                supports = sorted(valid_supports, reverse=True)[:10]
-                # Filter and sort
-                # resistances = sorted([h for h in pivot_highs if h > current_price])[:3]
-                # supports = sorted([l for l in pivot_lows if l < current_price], reverse=True)[:3]
-                
-                return supports, resistances
-            
-    # @staticmethod
-    # def find_high_accuracy_support_resistance_combined(
-    #             historical_df: pd.DataFrame, 
-    #             option_chain_data: List[Dict], 
-    #             current_price: float,
-    #             tolerance_pct: float = 0.015,  # 1.5% tolerance
-    #             min_touch_count: int = 2  # Minimum number of times price touched the level
-    #         ) -> Tuple[List[Dict], List[Dict]]:
-    #             """
-    #             Find high accuracy support and resistance levels by combining:
-    #             1. Top 3 option chain OI levels
-    #             2. Historical price action validation
-    #             3. Multiple touch confirmation
-    #             """
-    #             if historical_df.empty or not option_chain_data:
-    #                 return [], []
-                
-    #             oc_supports, oc_resistances,market_bias = MarketAnalyzer.find_support_resistance_option_chain(
-    #                 option_chain_data, current_price
-    #             )
-                
-    #             # Find swing highs and lows from historical data
-    #             swing_highs, swing_lows = MarketAnalyzer.find_swing_points(historical_df)
-                
-    #             # Create lists of all historical highs and lows for validation
-    #             all_highs = historical_df['High'].tolist()
-    #             all_lows = historical_df['Low'].tolist()
-    #             all_closes = historical_df['Close'].tolist()
-                
-    #             high_accuracy_supports = []
-    #             high_accuracy_resistances = []
-                
-    #             # Process option chain supports with historical validation
-    #             for i, oc_support in enumerate(oc_supports[:3]):  # Top 3 only
-    #                 tolerance = oc_support * tolerance_pct
-    #                 lower_bound = oc_support - tolerance
-    #                 upper_bound = oc_support + tolerance
-                    
-    #                 # Find historical validation points
-    #                 historical_touches = []
-    #                 swing_confirmations = []
-                    
-    #                 # Check swing lows near this level
-    #                 for swing_low in swing_lows:
-    #                     if lower_bound <= swing_low <= upper_bound:
-    #                         swing_confirmations.append(swing_low)
-                    
-    #                 # Check all lows for touch count
-    #                 for low in all_lows:
-    #                     if lower_bound <= low <= upper_bound:
-    #                         historical_touches.append(low)
-                    
-    #                 # Check closes for additional validation
-    #                 close_touches = [close for close in all_closes 
-    #                                 if lower_bound <= close <= upper_bound]
-                    
-    #                 total_touches = len(historical_touches) + len(close_touches)
-                    
-    #                 # Calculate accuracy score based on multiple factors
-    #                 accuracy_score = 0
-                    
-    #                 # Factor 1: Number of swing confirmations (high weight)
-    #                 accuracy_score += len(swing_confirmations) * 30
-                    
-    #                 # Factor 2: Total touch count (medium weight)
-    #                 if total_touches >= min_touch_count:
-    #                     accuracy_score += min(total_touches * 15, 60)  # Cap at 60
-                    
-    #                 # Factor 3: Recent validation (check last 20 candles)
-    #                 recent_data = historical_df.tail(20)
-    #                 recent_validation = any(
-    #                     lower_bound <= low <= upper_bound 
-    #                     for low in recent_data['Low'].tolist()
-    #                 )
-    #                 if recent_validation:
-    #                     accuracy_score += 25
-                    
-    #                 # Only include if meets minimum criteria
-    #                 if accuracy_score >= 50 and total_touches >= min_touch_count:
-    #                     # Use the most frequent level or average of swing confirmations
-    #                     if swing_confirmations:
-    #                         validated_level = sum(swing_confirmations) / len(swing_confirmations)
-    #                     else:
-    #                         validated_level = oc_support
-                        
-    #                     high_accuracy_supports.append({
-    #                         'level': round(validated_level, 2),
-    #                         'oi_support': oc_support,
-    #                         'accuracy_score': accuracy_score,
-    #                         'touch_count': total_touches,
-    #                         'swing_confirmations': len(swing_confirmations),
-    #                         'strength': 'HIGH' if accuracy_score >= 80 else 'MEDIUM',
-    #                         'rank': i + 1
-    #                     })
-                
-    #             # Process option chain resistances with historical validation
-    #             for i, oc_resistance in enumerate(oc_resistances[:3]):  # Top 3 only
-    #                 tolerance = oc_resistance * tolerance_pct
-    #                 lower_bound = oc_resistance - tolerance
-    #                 upper_bound = oc_resistance + tolerance
-                    
-    #                 # Find historical validation points
-    #                 historical_touches = []
-    #                 swing_confirmations = []
-                    
-    #                 # Check swing highs near this level
-    #                 for swing_high in swing_highs:
-    #                     if lower_bound <= swing_high <= upper_bound:
-    #                         swing_confirmations.append(swing_high)
-                    
-    #                 # Check all highs for touch count
-    #                 for high in all_highs:
-    #                     if lower_bound <= high <= upper_bound:
-    #                         historical_touches.append(high)
-                    
-    #                 # Check closes for additional validation
-    #                 close_touches = [close for close in all_closes 
-    #                                 if lower_bound <= close <= upper_bound]
-                    
-    #                 total_touches = len(historical_touches) + len(close_touches)
-                    
-    #                 # Calculate accuracy score
-    #                 accuracy_score = 0
-    #                 accuracy_score += len(swing_confirmations) * 30
-                    
-    #                 if total_touches >= min_touch_count:
-    #                     accuracy_score += min(total_touches * 15, 60)
-                    
-    #                 # Recent validation
-    #                 recent_data = historical_df.tail(20)
-    #                 recent_validation = any(
-    #                     lower_bound <= high <= upper_bound 
-    #                     for high in recent_data['High'].tolist()
-    #                 )
-    #                 if recent_validation:
-    #                     accuracy_score += 25
-                    
-    #                 if accuracy_score >= 50 and total_touches >= min_touch_count:
-    #                     if swing_confirmations:
-    #                         validated_level = sum(swing_confirmations) / len(swing_confirmations)
-    #                     else:
-    #                         validated_level = oc_resistance
-                        
-    #                     high_accuracy_resistances.append({
-    #                         'level': round(validated_level, 2),
-    #                         'oi_resistance': oc_resistance,
-    #                         'accuracy_score': accuracy_score,
-    #                         'touch_count': total_touches,
-    #                         'swing_confirmations': len(swing_confirmations),
-    #                         'strength': 'HIGH' if accuracy_score >= 80 else 'MEDIUM',
-    #                         'rank': i + 1
-    #                     })
-                
-    #             # Sort by accuracy score (highest first)
-    #             high_accuracy_supports.sort(key=lambda x: x['accuracy_score'], reverse=True)
-    #             high_accuracy_resistances.sort(key=lambda x: x['accuracy_score'], reverse=True)
-                
-    #             return high_accuracy_supports[:10], high_accuracy_resistances[:10]
-            
     @staticmethod
     def find_high_accuracy_support_resistance_combined_latest(
-                historical_df: pd.DataFrame, 
-                option_chain_data: List[Dict], 
-                current_price: float,
-                pclose_price: float,
-                symbol: str,
-                tolerance_pct: float = 0.015,
-                min_touch_count: int = 2
-            ) -> Tuple[List[Dict], List[Dict]]:
+            historical_df, option_chain_data, current_price, pclose_price, symbol,
+            tolerance_pct=0.015, min_touch_count=2):
 
-        # STEP 0: COMPUTE OPTION ANALYSIS INSIDE
-        option_analysis = MarketAnalyzer.analyze_option_chain(option_chain_data,current_price,pclose_price,symbol)
-        # print(option_analysis)
-        market_bias = option_analysis.get("sentiment", "NEUTRAL")
+        option_analysis=MarketAnalyzer.analyze_option_chain(option_chain_data,current_price,pclose_price,symbol)
+        market_bias=option_analysis.get("sentiment","NEUTRAL")
+        hist_supports,hist_resistances=MarketAnalyzer.find_support_resistance_historical(historical_df,current_price)
+        swing_highs,swing_lows=MarketAnalyzer.find_swing_points(historical_df)
+        oc_supports,oc_resistances,_=MarketAnalyzer.find_support_resistance_option_chain(
+            option_chain_data,current_price,pclose_price)
 
-        # Step 1: Historical S/R
-        hist_supports, hist_resistances = MarketAnalyzer.find_support_resistance_historical(
-            historical_df, current_price
-        )
+        tol=30
+        validated_supports=[]
+        for lvl in oc_supports:
+            lo,hi=lvl-tol,lvl+tol
+            vh=[s for s in hist_supports if lo<=s<=hi]; vs=[l for l in swing_lows if lo<=l<=hi]
+            if vh or vs: validated_supports.append({'level':lvl,'historical_matches':vh,'swing_matches':vs,'type':'SUPPORT'})
 
-        # Step 2: Swings
-        swing_highs, swing_lows = MarketAnalyzer.find_swing_points(historical_df)
+        validated_resistances=[]
+        for lvl in oc_resistances:
+            lo,hi=lvl-tol,lvl+tol
+            vh=[r for r in hist_resistances if lo<=r<=hi]; vs=[h for h in swing_highs if lo<=h<=hi]
+            if vh or vs: validated_resistances.append({'level':lvl,'historical_matches':vh,'swing_matches':vs,'type':'RESISTANCE'})
 
-        # Step 3: Option Chain Levels (S/R from OI)
-        oc_supports, oc_resistances, _ = MarketAnalyzer.find_support_resistance_option_chain(
-            option_chain_data, current_price, pclose_price
-        )
-
-        tolerance_points = 30
-
-        # Step 4: Validate Supports
-        validated_supports = []
-        for oc_support in oc_supports:
-            lower_limit = oc_support - tolerance_points
-            upper_limit = oc_support + tolerance_points
-
-            valid_hist = [s for s in hist_supports if lower_limit <= s <= upper_limit]
-            valid_swing = [l for l in swing_lows if lower_limit <= l <= upper_limit]
-
-            if valid_hist or valid_swing:
-                validated_supports.append({
-                    'level': oc_support,
-                    'historical_matches': valid_hist,
-                    'swing_matches': valid_swing,
-                    'type': 'SUPPORT'
-                })
-
-        # Step 4: Validate Resistances
-        validated_resistances = []
-        for oc_resistance in oc_resistances:
-            lower_limit = oc_resistance - tolerance_points
-            upper_limit = oc_resistance + tolerance_points
-
-            valid_hist = [r for r in hist_resistances if lower_limit <= r <= upper_limit]
-            valid_swing = [h for h in swing_highs if lower_limit <= h <= upper_limit]
-            if valid_hist or valid_swing:
-                validated_resistances.append({
-                    'level': oc_resistance,
-                    'historical_matches': valid_hist,
-                    'swing_matches': valid_swing,
-                    'type': 'RESISTANCE'
-                })
-
-        # Step 5: Nearest call/put
-        call_options = [opt for opt in option_chain_data if opt['option_type'] == 'CE']
-        put_options  = [opt for opt in option_chain_data if opt['option_type'] == 'PE']
-
-        nearest_call = min(call_options, key=lambda x: abs(x['strike_price'] - current_price)) if call_options else None
-        nearest_put  = min(put_options,  key=lambda x: abs(x['strike_price'] - current_price)) if put_options  else None
-        nearest_call_info = {
-            'name': nearest_call['name'],
-            'scripCode': nearest_call['ScripCode'],
-            'strike_price': nearest_call['strike_price'],
-            'last_price': nearest_call['last_price']
-        } if nearest_call else None
-
-        nearest_put_info = {
-            'name': nearest_put['name'],
-            'scripCode': nearest_put['ScripCode'],
-            'strike_price': nearest_put['strike_price'],
-            'last_price': nearest_put['last_price']
-        } if nearest_put else None
-
-        # Final Output including the PCR analysis
+        call_options=[o for o in option_chain_data if o['option_type']=='CE']
+        put_options =[o for o in option_chain_data if o['option_type']=='PE']
+        nearest_call=(min(call_options,key=lambda x:abs(x['strike_price']-current_price)) if call_options else None)
+        nearest_put =(min(put_options, key=lambda x:abs(x['strike_price']-current_price)) if put_options  else None)
+        nc =({'name':nearest_call['name'],'scripCode':nearest_call['ScripCode'],
+              'strike_price':nearest_call['strike_price'],'last_price':nearest_call['last_price']} if nearest_call else None)
+        np_=({'name':nearest_put['name'],'scripCode':nearest_put['ScripCode'],
+              'strike_price':nearest_put['strike_price'],'last_price':nearest_put['last_price']} if nearest_put else None)
         return {
-            'current_price': current_price,
-            'nearest_call': nearest_call_info,
-            'nearest_put': nearest_put_info,
-            'validated_supports': validated_supports,
-            'validated_resistances': validated_resistances,
-            'market_bias': market_bias,
-            'oc_supports': oc_supports,
-            'oc_resistances': oc_resistances,
-
-            # NEW FIELD RETURNED
-            'option_analysis': option_analysis
+            'current_price':current_price,'nearest_call':nc,'nearest_put':np_,
+            'validated_supports':validated_supports,'validated_resistances':validated_resistances,
+            'market_bias':market_bias,'oc_supports':oc_supports,'oc_resistances':oc_resistances,
+            'option_analysis':option_analysis
         }
 
+    @staticmethod
+    def calculate_fibonacci_levels(df):
+        if df.empty: return {}
+        high=df['High'].max(); low=df['Low'].min(); diff=high-low
+        return {'Fib_0':high,'Fib_23.6':high-0.236*diff,'Fib_38.2':high-0.382*diff,
+                'Fib_50':high-0.5*diff,'Fib_61.8':high-0.618*diff,'Fib_78.6':high-0.786*diff,'Fib_100':low}
 
     @staticmethod
-    def find_swing_points(df: pd.DataFrame) -> Tuple[List[float], List[float]]:
-                """Find swing highs and lows."""
-                if df.empty or len(df) < 5:
-                    return [], []
-                
-                swing_highs = []
-                swing_lows = []
-                
-                for i in range(2, len(df) - 2):
-                    # Swing High: higher than 2 periods before and after
-                    if (df.iloc[i]['High'] > df.iloc[i-2]['High'] and 
-                        df.iloc[i]['High'] > df.iloc[i-1]['High'] and
-                        df.iloc[i]['High'] > df.iloc[i+1]['High'] and
-                        df.iloc[i]['High'] > df.iloc[i+2]['High']):
-                        swing_highs.append(df.iloc[i]['High'])
-                    
-                    # Swing Low: lower than 2 periods before and after
-                    if (df.iloc[i]['Low'] < df.iloc[i-2]['Low'] and 
-                        df.iloc[i]['Low'] < df.iloc[i-1]['Low'] and
-                        df.iloc[i]['Low'] < df.iloc[i+1]['Low'] and
-                        df.iloc[i]['Low'] < df.iloc[i+2]['Low']):
-                        swing_lows.append(df.iloc[i]['Low'])
-                
-                return swing_highs, swing_lows
-            
+    def calculate_fibonacci_extension_levels(df):
+        if df.empty: return {}
+        high=df['High'].max(); low=df['Low'].min(); diff=high-low
+        return {'Ext_127.2':high+0.272*diff,'Ext_138.2':high+0.382*diff,'Ext_161.8':high+0.618*diff,
+                'Ext_200':high+diff,'Ext_261.8':high+1.618*diff,
+                'Ext_Down_127.2':low-0.272*diff,'Ext_Down_138.2':low-0.382*diff,
+                'Ext_Down_161.8':low-0.618*diff,'Ext_Down_200':low-diff,'Ext_Down_261.8':low-1.618*diff}
+
     @staticmethod
-    def find_supply_demand_zones(df: pd.DataFrame) -> Tuple[List[Dict], List[Dict]]:
-                """Find supply and demand zones."""
-                swing_highs, swing_lows = MarketAnalyzer.find_swing_points(df)
-                
-                # Supply zones around swing highs
-                supply_zones = []
-                for high in swing_highs[-5:]:  # Last 5 swing highs
-                    supply_zones.append({
-                        'level': high,
-                        'zone_top': high + (high * 0.002),  # 0.2% above
-                        'zone_bottom': high - (high * 0.002),  # 0.2% below
-                        'strength': 'MEDIUM'
-                    })
-                
-                # Demand zones around swing lows
-                demand_zones = []
-                for low in swing_lows[-5:]:  # Last 5 swing lows
-                    demand_zones.append({
-                        'level': low,
-                        'zone_top': low + (low * 0.002),  # 0.2% above
-                        'zone_bottom': low - (low * 0.002),  # 0.2% below
-                        'strength': 'MEDIUM'
-                    })
-                
-                return supply_zones, demand_zones
-            
+    def analyze_fibonacci_trend(df, current_price):
+        if df.empty or len(df)<50: return {'trend':'INSUFFICIENT_DATA','strength':'WEAK','key_levels':[]}
+        recent=df.tail(100)
+        sh_idx=recent['High'].idxmax(); sl_idx=recent['Low'].idxmin()
+        swing_high=recent['High'].max(); swing_low=recent['Low'].min(); diff=swing_high-swing_low
+        is_up=sl_idx<sh_idx
+        if is_up:
+            fib={'fib_0':swing_high,'fib_23.6':swing_high-0.236*diff,'fib_38.2':swing_high-0.382*diff,
+                 'fib_50':swing_high-0.5*diff,'fib_61.8':swing_high-0.618*diff,'fib_78.6':swing_high-0.786*diff,'fib_100':swing_low}
+        else:
+            fib={'fib_0':swing_low,'fib_23.6':swing_low+0.236*diff,'fib_38.2':swing_low+0.382*diff,
+                 'fib_50':swing_low+0.5*diff,'fib_61.8':swing_low+0.618*diff,'fib_78.6':swing_low+0.786*diff,'fib_100':swing_high}
+        rp=df['Close'].tail(20); momentum=(current_price-rp.iloc[0])/rp.iloc[0]*100
+        return {'trend':'UPTREND' if is_up and current_price>fib['fib_38.2'] else 'DOWNTREND',
+                'strength':'STRONG','swing_high':swing_high,'swing_low':swing_low,
+                'momentum':round(momentum,2),'fib_levels':fib}
+
     @staticmethod
-    def calculate_fibonacci_levels(df: pd.DataFrame) -> Dict[str, float]:
-                """Calculate Fibonacci retracement levels."""
-                if df.empty:
-                    return {}
-                
-                high = df['High'].max()
-                low = df['Low'].min()
-                diff = high - low
-                
-                fib_levels = {
-                    'Fib_0': high,
-                    'Fib_23.6': high - 0.236 * diff,
-                    'Fib_38.2': high - 0.382 * diff,
-                    'Fib_50': high - 0.5 * diff,
-                    'Fib_61.8': high - 0.618 * diff,
-                    'Fib_78.6': high - 0.786 * diff,
-                    'Fib_100': low
-                }
-                
-                return fib_levels
-            
+    def _determine_fibonacci_trend(current_price,fib_levels,is_uptrend_scenario,
+                                   recent_prices,recent_highs,recent_lows,price_momentum,swing_high,swing_low):
+        fib_23=fib_levels['fib_23.6'];fib_38=fib_levels['fib_38.2']
+        fib_50=fib_levels['fib_50'];fib_61=fib_levels['fib_61.8'];fib_78=fib_levels['fib_78.6']
+        signals,current_zone,key_levels=[],  "UNKNOWN",[]
+        if is_uptrend_scenario:
+            if current_price>fib_23:
+                current_zone,trend,strength="ABOVE_23.6","STRONG_UPTREND","VERY_STRONG"
+                key_levels=[fib_23,fib_38];fib_support,fib_resistance=fib_23,swing_high
+                signals.append("Price holding above 23.6% - Very bullish")
+            elif current_price>fib_38:
+                current_zone="ABOVE_38.2";trend="UPTREND"
+                strength="STRONG" if recent_lows.min()<=fib_38 else "MODERATE"
+                key_levels=[fib_38,fib_50];fib_support,fib_resistance=fib_38,swing_high
+            elif current_price>fib_50:
+                current_zone="ABOVE_50"
+                if recent_lows.min()<=fib_50 and price_momentum>0: trend,strength="UPTREND","MODERATE"
+                else: trend,strength="CONSOLIDATING","WEAK"
+                key_levels=[fib_50,fib_61];fib_support,fib_resistance=fib_50,fib_38
+            elif current_price>fib_61:
+                current_zone,trend,strength="ABOVE_61.8","WEAK_UPTREND","WEAK"
+                key_levels=[fib_61,fib_78];fib_support,fib_resistance=fib_61,fib_50
+            elif current_price>fib_78:
+                current_zone,trend,strength="ABOVE_78.6","TREND_REVERSAL_RISK","VERY_WEAK"
+                key_levels=[fib_78,swing_low];fib_support,fib_resistance=fib_78,fib_61
+            else:
+                current_zone,trend,strength="BELOW_78.6","DOWNTREND","STRONG"
+                key_levels=[swing_low,fib_78];fib_support,fib_resistance=swing_low,fib_78
+        else:
+            if current_price<fib_23:
+                current_zone,trend,strength="BELOW_23.6","STRONG_DOWNTREND","VERY_STRONG"
+                key_levels=[fib_23,fib_38];fib_resistance,fib_support=fib_23,swing_low
+            elif current_price<fib_38:
+                current_zone="BELOW_38.2";trend="DOWNTREND"
+                strength="STRONG" if recent_highs.max()>=fib_38 else "MODERATE"
+                key_levels=[fib_38,fib_50];fib_resistance,fib_support=fib_38,swing_low
+            elif current_price<fib_50:
+                current_zone="BELOW_50"
+                if recent_highs.max()>=fib_50 and price_momentum<0: trend,strength="DOWNTREND","MODERATE"
+                else: trend,strength="CONSOLIDATING","WEAK"
+                key_levels=[fib_50,fib_61];fib_resistance,fib_support=fib_50,fib_38
+            elif current_price<fib_61:
+                current_zone,trend,strength="BELOW_61.8","WEAK_DOWNTREND","WEAK"
+                key_levels=[fib_61,fib_78];fib_resistance,fib_support=fib_61,fib_50
+            elif current_price<fib_78:
+                current_zone,trend,strength="BELOW_78.6","TREND_REVERSAL_RISK","VERY_WEAK"
+                key_levels=[fib_78,swing_high];fib_resistance,fib_support=fib_78,fib_61
+            else:
+                current_zone,trend,strength="ABOVE_78.6","UPTREND","STRONG"
+                key_levels=[swing_high,fib_78];fib_resistance,fib_support=swing_high,fib_78
+        return {'trend':trend,'strength':strength,'current_zone':current_zone,'key_levels':key_levels,
+                'fib_support':fib_support,'fib_resistance':fib_resistance,'signals':signals}
+
     @staticmethod
-    def calculate_fibonacci_extension_levels(df: pd.DataFrame) -> Dict[str, float]:
-                """Calculate Fibonacci extension levels for projecting targets."""
-                if df.empty:
-                    return {}
-                
-                high = df['High'].max()
-                low = df['Low'].min()
-                diff = high - low
-                
-                # Extensions beyond the range (for breakout targets)
-                extension_levels = {
-                    'Ext_127.2': high + 0.272 * diff,
-                    'Ext_138.2': high + 0.382 * diff,
-                    'Ext_161.8': high + 0.618 * diff,
-                    'Ext_200': high + diff,
-                    'Ext_261.8': high + 1.618 * diff,
-                    # Downside extensions
-                    'Ext_Down_127.2': low - 0.272 * diff,
-                    'Ext_Down_138.2': low - 0.382 * diff,
-                    'Ext_Down_161.8': low - 0.618 * diff,
-                    'Ext_Down_200': low - diff,
-                    'Ext_Down_261.8': low - 1.618 * diff
-                }
-                
-                return extension_levels
-            
+    def _calculate_trend_extensions(swing_high,swing_low,diff,trend):
+        if 'UPTREND' in trend:
+            return {'target_127.2':swing_high+0.272*diff,'target_138.2':swing_high+0.382*diff,
+                    'target_161.8':swing_high+0.618*diff,'target_200':swing_high+diff}
+        elif 'DOWNTREND' in trend:
+            return {'target_127.2':swing_low-0.272*diff,'target_138.2':swing_low-0.382*diff,
+                    'target_161.8':swing_low-0.618*diff,'target_200':swing_low-diff}
+        return {}
+
     @staticmethod
-    def analyze_fibonacci_trend(df: pd.DataFrame, current_price: float) -> Dict[str, Any]:
-                """
-                Enhanced Fibonacci trend analysis with accurate uptrend and downtrend detection.
-                Analyzes price action relative to Fibonacci levels and recent swing movements.
-                """
-                if df.empty or len(df) < 50:
-                    return {'trend': 'INSUFFICIENT_DATA', 'strength': 'WEAK', 'key_levels': []}
-                
-                # Calculate Fibonacci levels from recent swing high to swing low
-                recent_data = df.tail(100)  # Last 100 periods for trend analysis
-                
-                # Find recent significant swing high and low
-                swing_high_idx = recent_data['High'].idxmax()
-                swing_low_idx = recent_data['Low'].idxmin()
-                
-                swing_high = recent_data['High'].max()
-                swing_low = recent_data['Low'].min()
-                
-                # Determine if we're in uptrend or downtrend scenario based on swing sequence
-                is_uptrend_scenario = swing_low_idx < swing_high_idx  # Low came before high
-                
-                # Calculate Fibonacci levels
-                diff = swing_high - swing_low
-                
-                if is_uptrend_scenario:
-                    # Uptrend Fibonacci retracement (from high back to low)
-                    fib_levels = {
-                        'fib_0': swing_high,
-                        'fib_23.6': swing_high - 0.236 * diff,
-                        'fib_38.2': swing_high - 0.382 * diff,
-                        'fib_50': swing_high - 0.5 * diff,
-                        'fib_61.8': swing_high - 0.618 * diff,
-                        'fib_78.6': swing_high - 0.786 * diff,
-                        'fib_100': swing_low
-                    }
-                else:
-                    # Downtrend Fibonacci retracement (from low back up to high)
-                    fib_levels = {
-                        'fib_0': swing_low,
-                        'fib_23.6': swing_low + 0.236 * diff,
-                        'fib_38.2': swing_low + 0.382 * diff,
-                        'fib_50': swing_low + 0.5 * diff,
-                        'fib_61.8': swing_low + 0.618 * diff,
-                        'fib_78.6': swing_low + 0.786 * diff,
-                        'fib_100': swing_high
-                    }
-                
-                # Analyze recent price action (last 20 periods)
-                recent_prices = df['Close'].tail(20)
-                recent_highs = df['High'].tail(20)
-                recent_lows = df['Low'].tail(20)
-                
-                price_momentum = (current_price - recent_prices.iloc[0]) / recent_prices.iloc[0] * 100
-                volatility = recent_prices.std() / recent_prices.mean() * 100
-                
-                # Trend determination logic
-                trend_analysis = MarketAnalyzer._determine_fibonacci_trend(
-                    current_price, fib_levels, is_uptrend_scenario, recent_prices, 
-                    recent_highs, recent_lows, price_momentum, swing_high, swing_low
-                )
-                
-                # Calculate extension levels for targets
-                extension_levels = MarketAnalyzer._calculate_trend_extensions(
-                    swing_high, swing_low, diff, trend_analysis['trend']
-                )
-                
-                return {
-                    'trend': trend_analysis['trend'],
-                    'strength': trend_analysis['strength'],
-                    'scenario': 'UPTREND_RETRACEMENT' if is_uptrend_scenario else 'DOWNTREND_RETRACEMENT',
-                    'current_fib_zone': trend_analysis['current_zone'],
-                    'key_levels': trend_analysis['key_levels'],
-                    'extensions': extension_levels,
-                    'swing_high': swing_high,
-                    'swing_low': swing_low,
-                    'momentum': round(price_momentum, 2),
-                    'volatility': round(volatility, 2),
-                    'fib_support': trend_analysis.get('fib_support', 0),
-                    'fib_resistance': trend_analysis.get('fib_resistance', 0),
-                    'signals': trend_analysis.get('signals', [])
-                }
-            
+    def get_trendlines(df):
+        if df is None or df.empty: return [],[]
+        (_,support_lines),_=trendln.calc_support_resistance(df['Low'].values,method=trendln.METHOD_NSQURED,accuracy=2)
+        _,(_,resistance_lines)=trendln.calc_support_resistance(df['High'].values,method=trendln.METHOD_NSQURED,accuracy=2)
+        return support_lines[-2:],resistance_lines[-2:]
+
     @staticmethod
-    def _determine_fibonacci_trend(current_price: float, fib_levels: Dict, is_uptrend_scenario: bool,
-                                        recent_prices: pd.Series, recent_highs: pd.Series, recent_lows: pd.Series,
-                                        price_momentum: float, swing_high: float, swing_low: float) -> Dict[str, Any]:
-                """Determine trend based on Fibonacci analysis."""
-                
-                fib_23 = fib_levels['fib_23.6']
-                fib_38 = fib_levels['fib_38.2']
-                fib_50 = fib_levels['fib_50']
-                fib_61 = fib_levels['fib_61.8']
-                fib_78 = fib_levels['fib_78.6']
-                
-                signals = []
-                current_zone = "UNKNOWN"
-                key_levels = []
-                
-                if is_uptrend_scenario:
-                    # Uptrend retracement analysis
-                    if current_price > fib_23:
-                        current_zone = "ABOVE_23.6"
-                        trend = "STRONG_UPTREND"
-                        strength = "VERY_STRONG"
-                        key_levels = [fib_23, fib_38]
-                        fib_support = fib_23
-                        fib_resistance = swing_high
-                        signals.append("Price holding above 23.6% - Very bullish")
-                        
-                    elif current_price > fib_38:
-                        current_zone = "ABOVE_38.2"
-                        # Check if price bounced from fib levels
-                        recent_low = recent_lows.min()
-                        if recent_low <= fib_38 and current_price > fib_38:
-                            trend = "UPTREND"
-                            strength = "STRONG"
-                            signals.append("Bounce from 38.2% fib - Bullish continuation")
-                        else:
-                            trend = "UPTREND"
-                            strength = "MODERATE"
-                        key_levels = [fib_38, fib_50]
-                        fib_support = fib_38
-                        fib_resistance = swing_high
-                        
-                    elif current_price > fib_50:
-                        current_zone = "ABOVE_50"
-                        recent_low = recent_lows.min()
-                        if recent_low <= fib_50 and current_price > fib_50 and price_momentum > 0:
-                            trend = "UPTREND"
-                            strength = "MODERATE"
-                            signals.append("Holding above 50% after retest - Cautiously bullish")
-                        else:
-                            trend = "CONSOLIDATING"
-                            strength = "WEAK"
-                        key_levels = [fib_50, fib_61]
-                        fib_support = fib_50
-                        fib_resistance = fib_38
-                        
-                    elif current_price > fib_61:
-                        current_zone = "ABOVE_61.8"
-                        trend = "WEAK_UPTREND"
-                        strength = "WEAK"
-                        key_levels = [fib_61, fib_78]
-                        fib_support = fib_61
-                        fib_resistance = fib_50
-                        signals.append("Deep retracement - Trend weakening")
-                        
-                    elif current_price > fib_78:
-                        current_zone = "ABOVE_78.6"
-                        trend = "TREND_REVERSAL_RISK"
-                        strength = "VERY_WEAK"
-                        key_levels = [fib_78, swing_low]
-                        fib_support = fib_78
-                        fib_resistance = fib_61
-                        signals.append("Very deep retracement - High reversal risk")
-                        
-                    else:
-                        current_zone = "BELOW_78.6"
-                        trend = "DOWNTREND"
-                        strength = "STRONG"
-                        key_levels = [swing_low, fib_78]
-                        fib_support = swing_low
-                        fib_resistance = fib_78
-                        signals.append("Break below 78.6% - Trend reversal confirmed")
-                
-                else:
-                    # Downtrend retracement analysis
-                    if current_price < fib_23:
-                        current_zone = "BELOW_23.6"
-                        trend = "STRONG_DOWNTREND"
-                        strength = "VERY_STRONG"
-                        key_levels = [fib_23, fib_38]
-                        fib_resistance = fib_23
-                        fib_support = swing_low
-                        signals.append("Price holding below 23.6% - Very bearish")
-                        
-                    elif current_price < fib_38:
-                        current_zone = "BELOW_38.2"
-                        recent_high = recent_highs.max()
-                        if recent_high >= fib_38 and current_price < fib_38:
-                            trend = "DOWNTREND"
-                            strength = "STRONG"
-                            signals.append("Rejection at 38.2% fib - Bearish continuation")
-                        else:
-                            trend = "DOWNTREND"
-                            strength = "MODERATE"
-                        key_levels = [fib_38, fib_50]
-                        fib_resistance = fib_38
-                        fib_support = swing_low
-                        
-                    elif current_price < fib_50:
-                        current_zone = "BELOW_50"
-                        recent_high = recent_highs.max()
-                        if recent_high >= fib_50 and current_price < fib_50 and price_momentum < 0:
-                            trend = "DOWNTREND"
-                            strength = "MODERATE"
-                            signals.append("Rejection at 50% - Cautiously bearish")
-                        else:
-                            trend = "CONSOLIDATING"
-                            strength = "WEAK"
-                        key_levels = [fib_50, fib_61]
-                        fib_resistance = fib_50
-                        fib_support = fib_38
-                        
-                    elif current_price < fib_61:
-                        current_zone = "BELOW_61.8"
-                        trend = "WEAK_DOWNTREND"
-                        strength = "WEAK"
-                        key_levels = [fib_61, fib_78]
-                        fib_resistance = fib_61
-                        fib_support = fib_50
-                        signals.append("Deep retracement - Trend weakening")
-                        
-                    elif current_price < fib_78:
-                        current_zone = "BELOW_78.6"
-                        trend = "TREND_REVERSAL_RISK"
-                        strength = "VERY_WEAK"
-                        key_levels = [fib_78, swing_high]
-                        fib_resistance = fib_78
-                        fib_support = fib_61
-                        signals.append("Very deep retracement - High reversal risk")
-                        
-                    else:
-                        current_zone = "ABOVE_78.6"
-                        trend = "UPTREND"
-                        strength = "STRONG"
-                        key_levels = [swing_high, fib_78]
-                        fib_resistance = swing_high
-                        fib_support = fib_78
-                        signals.append("Break above 78.6% - Trend reversal confirmed")
-                
-                return {
-                    'trend': trend,
-                    'strength': strength,
-                    'current_zone': current_zone,
-                    'key_levels': key_levels,
-                    'fib_support': fib_support,
-                    'fib_resistance': fib_resistance,
-                    'signals': signals
-                }
-            
+    def get_line_value(line): return line[1][-1]
+
     @staticmethod
-    def _calculate_trend_extensions(swing_high: float, swing_low: float, diff: float, trend: str) -> Dict[str, float]:
-                """Calculate Fibonacci extension levels for trend targets."""
-                extensions = {}
-                
-                if 'UPTREND' in trend:
-                    extensions = {
-                        'target_127.2': swing_high + 0.272 * diff,
-                        'target_138.2': swing_high + 0.382 * diff,
-                        'target_161.8': swing_high + 0.618 * diff,
-                        'target_200': swing_high + diff
-                    }
-                elif 'DOWNTREND' in trend:
-                    extensions = {
-                        'target_127.2': swing_low - 0.272 * diff,
-                        'target_138.2': swing_low - 0.382 * diff,
-                        'target_161.8': swing_low - 0.618 * diff,
-                        'target_200': swing_low - diff
-                    }
-                
-                return extensions
+    def is_near_level(price,lines,threshold=15):
+        for line in lines:
+            if abs(price-MarketAnalyzer.get_line_value(line))<=threshold: return True
+        return False
+
+    @staticmethod
+    def find_dynamic_support_resistance(option_chain_data,current_price):
+        calls=[o for o in option_chain_data if o.get('option_type','').upper()=='CE']
+        puts =[o for o in option_chain_data if o.get('option_type','').upper()=='PE']
+        def cs(opt): return opt.get('open_interest',0)*0.6+max(opt.get('change_in_oi',0),0)*0.3+opt.get('volume',0)*0.1
+        put_s =sorted([(o.get('strike_price'),cs(o)) for o in puts  if o.get('strike_price',0)<=current_price],key=lambda x:x[1],reverse=True)[:3]
+        call_s=sorted([(o.get('strike_price'),cs(o)) for o in calls if o.get('strike_price',0)>=current_price],key=lambda x:x[1],reverse=True)[:3]
+        return put_s,call_s
+
+    @staticmethod
+    def find_supply_demand_zones(df):
+        swing_highs,swing_lows=MarketAnalyzer.find_swing_points(df)
+        supply=[{'level':h,'zone_top':h*1.002,'zone_bottom':h*0.998,'strength':'MEDIUM'} for h in swing_highs[-5:]]
+        demand=[{'level':l,'zone_top':l*1.002,'zone_bottom':l*0.998,'strength':'MEDIUM'} for l in swing_lows[-5:]]
+        return supply,demand
+
+# ======================================================
+# ORB HELPER  — S7
+# ======================================================
+
+class ORBHelper:
+    @staticmethod
+    def get_or_build_orb(symbol, hist_df):
+        now=datetime.now(); today_key=f"{symbol}_{now.date()}"
+        existing=CONFIG.orb_state.get(today_key)
+        if existing and existing.get("ready"): return existing
+        if now.time()<dtime(9,31): return {"high":None,"low":None,"ready":False}
+        if hist_df is None or hist_df.empty: return {"high":None,"low":None,"ready":False}
+        df=hist_df.copy()
+        if not pd.api.types.is_datetime64_any_dtype(df.index):
+            for col in ['Datetime','Date','datetime','date']:
+                if col in df.columns:
+                    df[col]=pd.to_datetime(df[col]); df=df.set_index(col); break
+        today_str=now.strftime("%Y-%m-%d")
+        try:    day_df=df[today_str]
+        except: day_df=df[df.index.date==now.date()]
+        if day_df.empty: return {"high":None,"low":None,"ready":False}
+        orb_df=day_df.between_time("09:15","09:30")
+        if orb_df.empty: return {"high":None,"low":None,"ready":False}
+        orb_high=float(orb_df['High'].max()); orb_low=float(orb_df['Low'].min())
+        atr_val=float(df['Close'].tail(14).std())
+        orb={"high":orb_high,"low":orb_low,"atr":atr_val,"ready":True}
+        CONFIG.orb_state[today_key]=orb
+        Logger.info(f"[{symbol}] ORB → High:{orb_high} | Low:{orb_low}")
+        return orb
+
+# ======================================================
+# TARGET CALCULATOR  — central helper for all strategies
+# ======================================================
+
+class TargetCalculator:
+    """
+    Computes (sl_price, target_price) for every strategy and direction.
+
+    For option premium-based exits:
+      - SL   = entry_price - risk_per_unit   (CE) / entry_price + risk_per_unit (PE)
+      - Target = entry_price + risk_per_unit * RR  (CE) / entry_price - risk_per_unit * RR (PE)
+
+    risk_per_unit is derived from the UNDERLYING index ATR converted to option premium
+    using a simple approximation:  risk_per_unit ≈ atr * delta (default 0.5 for ATM)
+
+    All S7 and S8 targets also use underlying price levels (stored separately as
+    sl_price / target_price on the underlying index), but the option premium SL/target
+    drives the actual trade exit.
+    """
+
+    @staticmethod
+    def compute(sid: str, direction: str, entry_option_price: float,
+                atr: float, current_index_price: float = 0,
+                extra: Dict = None) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Returns (sl_price, target_price) in option premium terms.
+        extra: dict with strategy-specific data (orb levels, swing levels etc.)
+        """
+        if entry_option_price <= 0:
+            return None, None
+
+        extra = extra or {}
+        rr    = RR.get(sid, 2.0)
+
+        # ── ATM delta approximation (0.5 for ATM options)
+        atm_delta = 0.50
+
+        # risk in option premium ≈ ATR of underlying × delta
+        # clamp to at least 5 points, at most 30% of entry price
+        risk = max(atr * atm_delta, 5.0)
+        risk = min(risk, entry_option_price * 0.30)
+
+        # ── Strategy-specific overrides ────────────────────────────────
+        if sid == "S1":
+            # Zone bounce: tight SL — 1 × risk, target 1.5 ×
+            risk = max(atr * 0.4, 4.0)
+
+        elif sid == "S4":
+            # BB breakout: wider SL for momentum
+            risk = max(atr * 0.6, 6.0)
+
+        elif sid == "S7":
+            # ORB: SL is fixed to ORB boundary in premium equivalent
+            orb_high = extra.get("orb_high")
+            orb_low  = extra.get("orb_low")
+            if direction == "CE" and orb_low and current_index_price:
+                # underlying risk = current_price - orb_low
+                underlying_risk = max(current_index_price - orb_low, atr * 0.5)
+                risk = max(underlying_risk * atm_delta, 5.0)
+            elif direction == "PE" and orb_high and current_index_price:
+                underlying_risk = max(orb_high - current_index_price, atr * 0.5)
+                risk = max(underlying_risk * atm_delta, 5.0)
+
+        elif sid == "S8":
+            # S8: SL is swing level based — override if already computed
+            s8_sl = extra.get("ce_sl") if direction == "CE" else extra.get("pe_sl")
+            if s8_sl and current_index_price:
+                underlying_risk = abs(current_index_price - s8_sl)
+                risk = max(underlying_risk * atm_delta, 5.0)
+
+        # ── Final SL / Target in option premium ──────────────────────
+        if direction == "CE":
+            sl_price     = round(entry_option_price - risk, 2)
+            target_price = round(entry_option_price + risk * rr, 2)
+        else:   # PE
+            sl_price     = round(entry_option_price - risk, 2)   # option price drops too
+            target_price = round(entry_option_price + risk * rr, 2)
+
+        # Clamp SL to minimum 1
+        sl_price = max(sl_price, 1.0)
+
+        return sl_price, target_price
 
 # ===============================
 # MAIN TRADING SYSTEM
 # ===============================
 
 class SimplifiedTradingSystem:
-    """Professional trading system focusing on analysis."""
-    
-    def __init__(self, credentials_path: str = "credentials.json"):
+    def __init__(self, credentials_path="credentials.json"):
         self.db_manager = DatabaseManager()
         self.api_client = APIClient(credentials_path)
-        self.analyzer = MarketAnalyzer()
-         # -----------------------------------
-        # DELTA + OI TRADE STATE (SEPARATE)
-        # -----------------------------------
-        self.delta_oi_state = {
-            "active": False,
-            "side": None,          # BUY_CE / BUY_PE
-            "entry_price": None
-        }
-        # -----------------------------------
-        # Initialize API client
+        self.analyzer   = MarketAnalyzer()
         if not self.api_client.initialize_client():
             raise Exception("Failed to initialize API client")
-        
-    
-    def display_positions(self) -> None:
-        """Display current positions with professional formatting."""
+
+        # Restore any OPEN trades from DB so monitoring continues after restart
+        self._restore_summary = self.db_manager.restore_open_trades()
+
+    def display_positions(self):
         positions = self.api_client.get_positions()
-        
         if not positions:
-            print("\nACTIVE POSITIONS: None")
-            return
-        
-        print(f"\n{'='*110}")
-        print(f"ACTIVE POSITIONS ({len(positions)} positions) - {datetime.now().strftime('%H:%M:%S')}")
-        print(f"{'='*110}")
-        print(f"{'#':<3} {'ScripName':<40} {'Code':<8} {'AvgRate':<9} {'LTP':<9} {'NetQty':<8} {'P&L':<12} {'Day%':<8}")
-        print(f"{'='*110}")
-        
+            print("\nACTIVE POSITIONS: None"); return
         total_pnl = 0.0
-        total_invested = 0.0
-        
+        print(f"\n{'='*110}")
+        print(f"ACTIVE POSITIONS ({len(positions)}) - {datetime.now().strftime('%H:%M:%S')}")
+        print(f"{'='*110}")
+        print(f"{'#':<3}{'ScripName':<42}{'Code':<8}{'AvgRate':<10}{'LTP':<10}{'NetQty':<8}{'P&L':<12}{'Day%':<8}")
+        print(f"{'='*110}")
         for i, pos in enumerate(positions, 1):
-            scrip_name = pos.get('ScripName', 'Unknown')[:38]  # Truncate long names
-            scrip_code = pos.get('ScripCode', 0)
-            avg_rate = pos.get('AvgRate', 0)
-            ltp = pos.get('LTP', 0)
-            net_qty = pos.get('NetQty', 0)
-            mtom = pos.get('MTOM', 0)  # Mark to Market P&L
-            prev_close = pos.get('PreviousClose', 0)
-            
-            # Calculate day change percentage
-            day_change_pct = ((ltp - prev_close) / prev_close * 100) if prev_close else 0
-            
-            # Calculate investment value
-            investment = abs(avg_rate * net_qty)
-            total_invested += investment
-            total_pnl += mtom
-            
-            # Color coding for P&L (using text indicators)
-            pnl_indicator = "+" if mtom >= 0 else "-"
-            day_indicator = "+" if day_change_pct >= 0 else ""
-            
-            print(f"{i:<3} {scrip_name:<40} {scrip_code:<8} "
-                  f"Rs.{avg_rate:<6.2f} Rs.{ltp:<6.2f} {net_qty:<8} "
-                  f"{pnl_indicator}Rs.{abs(mtom):<9.2f} {day_indicator}{day_change_pct:<6.2f}%")
-        
-        print(f"{'='*110}")
-        print(f"TOTAL INVESTMENT: Rs.{total_invested:,.2f}")
-        print(f"TOTAL P&L: Rs.{total_pnl:,.2f} ({(total_pnl/total_invested*100) if total_invested else 0:.2f}%)")
-        print(f"{'='*110}")
-    
-    def display_positions_compact(self) -> None:
-        """Display positions in compact format."""
+            name=pos.get('ScripName','')[:40]; code=pos.get('ScripCode',0)
+            avg=pos.get('AvgRate',0); ltp=pos.get('LTP',0)
+            qty=pos.get('NetQty',0); mtom=pos.get('MTOM',0); pclose=pos.get('PreviousClose',0)
+            day_pct=((ltp-pclose)/pclose*100) if pclose else 0
+            total_pnl+=mtom; pind="+" if mtom>=0 else "-"; dind="+" if day_pct>=0 else ""
+            print(f"{i:<3}{name:<42}{code:<8}Rs.{avg:<7.2f}Rs.{ltp:<7.2f}{qty:<8}"
+                  f"{pind}Rs.{abs(mtom):<9.2f}{dind}{day_pct:<6.2f}%")
+        print(f"{'='*110}"); print(f"TOTAL P&L: Rs.{total_pnl:,.2f}"); print(f"{'='*110}")
+
+    def display_positions_compact(self):
         positions = self.api_client.get_positions()
-        
         if not positions:
-            print("No active positions")
-            return
-        
-        total_pnl = sum(pos.get('MTOM', 0) for pos in positions)
-        
-        print("\nACTIVE POSITIONS SUMMARY:")
-        print("-" * 80)
-        print(f"{'Scrip':40} {'Qty':>6} {'LTP':>10} {'P&L':>12}")
-        print("-" * 80)
+            print("No active positions"); return
+        total_pnl = sum(pos.get('MTOM',0) for pos in positions)
+        print("\nACTIVE POSITIONS SUMMARY:"); print("-"*80)
+        print(f"{'Scrip':40} {'Qty':>6} {'LTP':>10} {'P&L':>12}"); print("-"*80)
         for pos in positions:
-            scrip = pos.get('ScripName', '')[:40]
-            qty = pos.get('NetQty', 0)
-            ltp = pos.get('LTP', 0)
-            pnl = pos.get('MTOM', 0)
-            print(f"{scrip:40} {qty:6} {ltp:10.2f} {pnl:12.2f}")
-        
-        print("-" * 80)
-        print(f"{'Total P&L':>58}: {total_pnl:12.2f}")
-        print("-" * 80)
-    
-    def run_analysis_loop(self) -> None:
-        """Run the main analysis loop."""
+            print(f"{pos.get('ScripName','')[:40]:40} {pos.get('NetQty',0):6} "
+                  f"{pos.get('LTP',0):10.2f} {pos.get('MTOM',0):12.2f}")
+        print("-"*80); print(f"{'Total P&L':>58}: {total_pnl:12.2f}"); print("-"*80)
 
+    def run_analysis_loop(self):
+        cycle = 0
         try:
-            cycle_count = 0
-                        
-
             while True:
-                # ----------------------------------
-                # 1️⃣ CHECK MARKET STATUS INSIDE LOOP
-                # ----------------------------------
-                # market_status = self.api_client.get_market_status()
-
-                # if not market_status.get("is_open"):
-                #     Logger.warning(
-                #         f"{market_status.get('message', 'Market closed')} | Waiting..."
-                #     )  
-                #     time.sleep(30) 
-                #     continue  # ✅ NOW THIS IS LEGAL
                 if self.api_client.is_trading_time():
-                    cycle_count += 1
-                    current_time = datetime.now()
-                    
+                    cycle += 1
                     print(f"\n{'='*60}")
-                    print(f"ANALYSIS CYCLE #{cycle_count} - {current_time.strftime('%H:%M:%S')}")
+                    print(f"ANALYSIS CYCLE #{cycle} — {datetime.now().strftime('%H:%M:%S')}")
                     print(f"{'='*60}")
-                    
-                    # Analyze each symbol
                     for symbol in CONFIG.SYMBOLS:
-                        try:
-                            self.analyze_symbol(symbol)
-                        except Exception as e:
-                            Logger.error(f"Error analyzing {symbol}: {e}")
-                    
-                    # Display positions (choose compact or full display)
-                    # self.display_positions_compact()  # or use self.display_positions() for full display
-                    
-                    # Wait before next cycle
-                    Logger.info(f"Cycle complete. Waiting {CONFIG.DATA_UPDATE_INTERVAL} seconds...")
+                        try:    self.analyze_symbol(symbol)
+                        except Exception as e: Logger.error(f"Error analysing {symbol}: {e}")
+                    Logger.info(f"Cycle complete. Waiting {CONFIG.DATA_UPDATE_INTERVAL}s…")
                     time.sleep(CONFIG.DATA_UPDATE_INTERVAL)
                 else:
-                    Logger.warning("Market is closed. Waiting for next trading session...")
+                    Logger.warning("Market closed — waiting…")
                     time.sleep(30)
         except KeyboardInterrupt:
-            Logger.info("Trading system stopped by user")
+            Logger.info("Stopped by user.")
         except Exception as e:
-            Logger.error(f"Critical system error: {e}")
-    
-    def analyze_symbol(self, symbol: str) -> None:
-        """Complete symbol analysis with enhanced support/resistance detection."""
-        # 1. Load option chain data and store
+            Logger.error(f"Critical error: {e}")
+
+    def analyze_symbol(self, symbol: str):
         option_chain = self.api_client.get_option_chain_data(symbol)
         if option_chain:
             self.db_manager.store_option_chain_data(symbol, option_chain)
-        
-        # 2. Load symbol feed
+
         current_data = self.api_client.get_current_price(symbol)
         if not current_data:
-            Logger.error(f"No current price data for {symbol}")
-            return
-        
+            Logger.error(f"No price data for {symbol}"); return
+
         current_price = current_data['ltp']
-        open_price = current_data.get('open', 0)
-        pclose_price = current_data.get('pclose', 0)
-        # Store market data
-        # self.db_manager.store_market_data(symbol, current_data)
-        
-        # 3. Load historical data (100 days, 5-minute data)
+        open_price    = current_data.get('open', 0)
+
         historical_data = self.api_client.fetch_historical_data(symbol, mins="5m", days_back=100)
-        
-        # historical_data15 = self.api_client.fetch_historical_data(symbol, mins="15m", days_back=100)
-
         if historical_data is None or historical_data.empty:
-            Logger.error(f"No historical data for {symbol}")
-            return
-        
-        # 4. Analyze option chain
-        # option_analysis = self.analyzer.analyze_option_chain(option_chain)
-        
-        # 5. Find support and resistance from OPTION CHAIN
-        # oc_supports, oc_resistances,market_bias = self.analyzer.find_support_resistance_option_chain(
-        #     option_chain, current_price, pclose_price
-        # )
-        
-        # # 6. Find support and resistance from HISTORICAL DATA
-        # hist_supports, hist_resistances = self.analyzer.find_support_resistance_historical(
-        #     historical_data, current_price
-        # )
-        # hist_supports15, hist_resistances15 = self.analyzer.find_support_resistance_historical(
-        #     historical_data15, current_price
-        # )
-        
-        # 7. NEW: Enhanced high accuracy support and resistance detection
-        # high_accuracy_supports, high_accuracy_resistances = self.analyzer.find_high_accuracy_support_resistance_combined(
-        #     historical_data, option_chain, current_price
-        # )
-        
-        
-        
-        # # Display enhanced comprehensive analysis
-        # self.display_enhanced_analysis(
-        #     symbol, current_price, current_data, option_analysis, 
-        #     oc_supports, oc_resistances, 
-        #     high_accuracy_supports, high_accuracy_resistances
-        # )
-        result = self.analyzer.find_high_accuracy_support_resistance_combined_latest(historical_data, option_chain, current_price,open_price,symbol)
-        option_analysis = result["option_analysis"]
+            Logger.error(f"No historical data for {symbol}"); return
 
-        # oi_sentiment = option_analysis.get("oi_sentiment")
-        # delta_score = option_analysis.get("delta_bias_score", 50)
-        # gamma_flip = option_analysis.get("gamma_flip_level", 0)
-        # pcr_oi = option_analysis.get("pcr_oi", 0)
-        # price = current_price
-
-        current_price = result['current_price']
-        nearest_call = result['nearest_call']
-        nearest_put = result['nearest_put']
-        validated_supports = result['validated_supports']
-        validated_resistances = result['validated_resistances']
-        oc_supports = result['oc_supports']
-        oc_resistances = result['oc_resistances']
-        market_bias = result['market_bias']
+        result = self.analyzer.find_high_accuracy_support_resistance_combined_latest(
+            historical_data, option_chain, current_price, open_price, symbol)
 
         hist_df = TechnicalIndicators.compute_all_indicators(historical_data)
 
-        # Now call the new display function
-        self.display_enhanced_analysis_latest(
-            symbol,
-            current_price,
-            nearest_call,
-            nearest_put,
-            current_data,
-            option_analysis,
-            oc_supports,
-            oc_resistances,
-            market_bias,
-            validated_supports,
-            validated_resistances,
-            hist_df,
-            option_chain
+        self.display_and_trade(
+            symbol, current_price,
+            result['nearest_call'], result['nearest_put'],
+            current_data, result['option_analysis'],
+            result['oc_supports'], result['oc_resistances'],
+            result['market_bias'],
+            result['validated_supports'], result['validated_resistances'],
+            hist_df, option_chain
         )
 
-        
-    def display_enhanced_analysis_latest(
-            self,
-            symbol,
-            current_price,
-            nearest_call,
-            nearest_put,
-            current_data,
-            option_analysis,
-            oc_supports,
-            oc_resistances,
-            market_bias,
-            validated_supports,
-            validated_resistances,
-            hist_df,
-            option_chain
-    ):
+    # ─────────────────────────────────────────────────────────
+    def display_and_trade(
+            self, symbol, current_price, nearest_call, nearest_put,
+            current_data, option_analysis, oc_supports, oc_resistances,
+            market_bias, validated_supports, validated_resistances,
+            hist_df, option_chain):
 
-        # ==================================================
-        # STEP 1 MARKET CONTEXT
-        # ==================================================
-        last = hist_df.iloc[-1]
-        ema9 = round(last.get("EMA_9", 0), 2)
-        ema21 = round(last.get("EMA_21", 0), 2)
+        try:
+            if hist_df is None or hist_df.empty:
+                print(f"❌ No historical data for {symbol}"); return
 
-        oi_sentiment = option_analysis.get("oi_sentiment", "NEUTRAL")
-        delta_bias = option_analysis.get("delta_bias_score", 50)
-        pcr_oi = option_analysis.get("pcr_oi", 1.0)
+            def _f(row, col, default=0):
+                v = row.get(col, default)
+                return (float(v) if v is not None and
+                        not (isinstance(v, float) and math.isnan(v)) else float(default))
 
-        print(f"\n{'='*80}")
-        print(f"MARKET ANALYSIS: {symbol}")
-        print(f"{'='*80}")
-        print(f"Price: Rs.{current_price:.2f} | EMA9: {ema9} | EMA21: {ema21}")
+            last = hist_df.iloc[-1]
+            prev = hist_df.iloc[-2] if len(hist_df) >= 2 else last
 
-        # ==================================================
-        # STEP 2 STATE INIT
-        # ==================================================
-        if symbol not in CONFIG.oi_state:
-            CONFIG.oi_state[symbol] = {
-                "bullish": False,
-                "bearish": False,
-                "bullish_level": None,
-                "bearish_level": None,
-                "trades": {
-                    s: {"CE": new_trade_state(), "PE": new_trade_state()}
-                    for s in ["S1", "S2", "S3", "S4", "S5", "S6"]
+            ema9       = _f(last, "EMA_9")
+            ema21      = _f(last, "EMA_21")
+            prev_ema9  = _f(prev, "EMA_9")
+            prev_ema21 = _f(prev, "EMA_21")
+            vwap       = _f(last, "VWAP")
+            rsi        = _f(last, "RSI", 50)
+            bb_high    = _f(last, "BB_High")
+            bb_low     = _f(last, "BB_Low")
+            macd       = _f(last, "MACD", 0)
+            prev_macd  = _f(prev, "MACD", 0)
+            stoch_k    = _f(last, "Stoch_K", 50)
+            stoch_d    = _f(last, "Stoch_D", 50)
+            atr        = _f(last, "ATR", 0)
+            last_vol   = int(_f(last, "Volume"))
+            avg_vol    = int(hist_df["Volume"].tail(20).mean() or 1)
+
+            oi_sentiment = option_analysis.get("oi_sentiment", "NEUTRAL")
+            delta_bias   = option_analysis.get("delta_bias_score", 50)
+
+            print(f"\n{'='*80}")
+            print(f"  {symbol}  |  Rs.{current_price:.2f}  |  {market_bias}")
+            print(f"  EMA9:{ema9:.2f}  EMA21:{ema21:.2f}  RSI:{rsi:.1f}  "
+                  f"MACD:{macd:.4f}  VWAP:{vwap:.2f}  ATR:{atr:.2f}  OI:{oi_sentiment}")
+            print(f"{'='*80}")
+
+            # ── HELPERS ──────────────────────────────────────────────
+            def get_token(opt):
+                if not opt: return None
+                return opt.get("ScripCode") or opt.get("scripCode") or opt.get("token")
+
+            def get_option_price(opt_type, token, strike):
+                """Get current option last_price from live option chain."""
+                for o in option_chain:
+                    if o.get("option_type") == opt_type:
+                        if o.get("ScripCode") == token or o.get("strike_price") == strike:
+                            return float(o.get("last_price", 0))
+                return None
+
+            # ── ZONE (S1) ─────────────────────────────────────────────
+            candle_low  = current_data["low"]
+            candle_high = current_data["high"]
+            range_val   = candle_high - candle_low
+            zone        = range_val * 0.25
+            ce_zone     = candle_low  <= current_price <= (candle_low  + zone)
+            pe_zone     = (candle_high - zone) <= current_price <= candle_high
+
+            # ── VALIDATED S/R ─────────────────────────────────────────
+            def _near_validated_support(price, tol=40):
+                for s in validated_supports:
+                    for m in s.get("historical_matches", [s.get("level", 0)]):
+                        if abs(price - m) <= tol: return True
+                return False
+
+            def _near_validated_resistance(price, tol=40):
+                for r in validated_resistances:
+                    for m in r.get("historical_matches", [r.get("level", 0)]):
+                        if abs(price - m) <= tol: return True
+                return False
+
+            bullish_touch = any(
+                candle_low < m < current_price
+                for s in validated_supports for m in s.get("historical_matches", [])
+            )
+            bearish_touch = any(
+                candle_high > m > current_price
+                for r in validated_resistances for m in r.get("historical_matches", [])
+            )
+
+            # ── ORB (S7) ──────────────────────────────────────────────
+            orb       = ORBHelper.get_or_build_orb(symbol, hist_df)
+            orb_ready = orb.get("ready", False)
+            orb_high  = orb.get("high")
+            orb_low   = orb.get("low")
+            orb_atr   = orb.get("atr", atr)
+            orb_ce_cond = (orb_ready and orb_high is not None and
+                           current_price > orb_high and oi_sentiment == "BULLISH")
+            orb_pe_cond = (orb_ready and orb_low  is not None and
+                           current_price < orb_low  and oi_sentiment == "BEARISH")
+            if orb_ready and orb_high:
+                print(f"  ORB → High:{orb_high} | Low:{orb_low}")
+
+            # ── S8 ────────────────────────────────────────────────────
+            s8 = S8Helper.evaluate(hist_df, current_price, atr, oi_sentiment)
+            if s8["ce_signal"] or s8["pe_signal"]:
+                print(f"  S8 → TL_UP:{s8['tl_break_up']} TL_DN:{s8['tl_break_down']} "
+                      f"| Bull:{s8['ce_pattern']} Swing_Low:{s8['ce_swing']} "
+                      f"| Bear:{s8['pe_pattern']} Swing_High:{s8['pe_swing']}")
+
+            # ── STATE INIT ────────────────────────────────────────────
+            ALL_STRATEGIES = ["S1","S2","S3","S4","S5","S6","S7","S8"]
+            if symbol not in CONFIG.oi_state:
+                CONFIG.oi_state[symbol] = {
+                    "bullish": False, "bearish": False,
+                    "trades": {s: {"CE": new_trade_state(), "PE": new_trade_state()}
+                               for s in ALL_STRATEGIES}
                 }
+            for s in ALL_STRATEGIES:
+                if s not in CONFIG.oi_state[symbol]["trades"]:
+                    CONFIG.oi_state[symbol]["trades"][s] = {
+                        "CE": new_trade_state(), "PE": new_trade_state()
+                    }
+
+            state = CONFIG.oi_state[symbol]
+            state["bullish"] = bullish_touch
+            state["bearish"] = bearish_touch
+
+            # ============================================================
+            # STRATEGIES — ENTRY CONDITIONS
+            # ============================================================
+            strategies = {
+                # S1 · Zone Bounce
+                "S1": lambda d: (
+                    (d=="CE" and ce_zone and state["bullish"]) or
+                    (d=="PE" and pe_zone and state["bearish"])
+                ),
+                # S2 · EMA Crossover
+                "S2": lambda d: (
+                    (d=="CE" and prev_ema9<=prev_ema21 and ema9>ema21 and oi_sentiment=="BULLISH") or
+                    (d=="PE" and prev_ema9>=prev_ema21 and ema9<ema21 and oi_sentiment=="BEARISH")
+                ),
+                # S3 · VWAP + RSI
+                "S3": lambda d: (
+                    (d=="CE" and current_price>vwap and rsi>55 and oi_sentiment=="BULLISH") or
+                    (d=="PE" and current_price<vwap and rsi<45 and oi_sentiment=="BEARISH")
+                ),
+                # S4 · BB Breakout + Volume
+                "S4": lambda d: (
+                    (d=="CE" and current_price>bb_high and last_vol>avg_vol*1.5 and oi_sentiment=="BULLISH") or
+                    (d=="PE" and current_price<bb_low  and last_vol>avg_vol*1.5 and oi_sentiment=="BEARISH")
+                ),
+                # S5 · RSI Extreme at S/R
+                "S5": lambda d: (
+                    (d=="CE" and rsi<35 and _near_validated_support(current_price)    and oi_sentiment=="BULLISH") or
+                    (d=="PE" and rsi>65 and _near_validated_resistance(current_price) and oi_sentiment=="BEARISH")
+                ),
+                # S6 · MACD + Stoch
+                "S6": lambda d: (
+                    (d=="CE" and prev_macd<=0 and macd>0 and stoch_k>stoch_d and oi_sentiment=="BULLISH") or
+                    (d=="PE" and prev_macd>=0 and macd<0 and stoch_k<stoch_d and oi_sentiment=="BEARISH")
+                ),
+                # S7 · ORB
+                "S7": lambda d: (
+                    (d=="CE" and orb_ce_cond) or
+                    (d=="PE" and orb_pe_cond)
+                ),
+                # S8 · Swing + Trendline + Candle
+                "S8": lambda d: (
+                    (d=="CE" and s8["ce_signal"]) or
+                    (d=="PE" and s8["pe_signal"])
+                ),
             }
 
-        state = CONFIG.oi_state[symbol]
+            # ============================================================
+            # PER-STRATEGY EXIT CONDITIONS
+            # Returns (should_exit: bool, reason: str)
+            # ============================================================
+            def exit_condition(sid: str, opt_type: str, trade: Dict):
+                entry_p    = trade.get("entry_price")
+                sl_p       = trade.get("sl_price")
+                target_p   = trade.get("target_price")
+                cur_opt_p  = get_option_price(opt_type, trade.get("token"), trade.get("strike"))
 
-        # ==================================================
-        # STEP 3 PRICE CONFIRMATION
-        # ==================================================
-        candle_low = current_data["low"]
-        candle_high = current_data["high"]
+                # ── Universal SL / Target hit check (option premium) ──
+                if cur_opt_p is not None and entry_p is not None:
+                    if sl_p     is not None and cur_opt_p <= sl_p:
+                        return True, "SL_HIT"
+                    if target_p is not None and cur_opt_p >= target_p:
+                        return True, "TARGET_HIT"
 
-        state["bullish"] = state["bearish"] = False
+                # ── Strategy-specific signal reversal exits ────────────
+                if sid == "S1":
+                    rev = not ce_zone if opt_type=="CE" else not pe_zone
+                    return rev, "SIGNAL_REVERSAL"
 
-        supports = {x for s in validated_supports for x in s.get("historical_matches", [])}
-        resistances = {x for r in validated_resistances for x in r.get("historical_matches", [])}
+                elif sid == "S2":
+                    rev = ema9 < ema21 if opt_type=="CE" else ema9 > ema21
+                    return rev, "SIGNAL_REVERSAL"
 
-        for lvl in supports:
-            if candle_low < lvl < current_price:
-                state["bullish"] = True
-                state["bullish_level"] = lvl
-
-        for lvl in resistances:
-            if candle_high > lvl > current_price:
-                state["bearish"] = True
-                state["bearish_level"] = lvl
-
-        # ==================================================
-        # STEP 4 ZONE LOGIC (NEW 🔥)
-        # ==================================================
-        range_val = candle_high - candle_low
-        zone = range_val * 0.25
-
-        ce_zone_start = candle_high - zone
-        pe_zone_end = candle_low + zone
-
-        ce_zone_condition = ce_zone_start <= current_price <= candle_high
-        pe_zone_condition = candle_low <= current_price <= pe_zone_end
-
-        # ==================================================
-        # STEP 5 STRATEGIES
-        # ==================================================
-        strategies = {
-
-            "S1": lambda d: (
-                (d == "CE" and ema9 > ema21) or
-                (d == "PE" and ema9 < ema21)
-            ),
-
-            "S2": lambda d: (
-                (d == "CE" and ema9 > ema21) or
-                (d == "PE" and ema9 < ema21)
-            ),
-
-            "S3": lambda d: True,
-
-            "S4": lambda d: (
-                ((d == "CE" and ce_zone_condition) or (d == "PE" and pe_zone_condition)) and
-                ((d == "CE" and ema9 > ema21) or (d == "PE" and ema9 < ema21))
-            ),
-
-            "S5": lambda d: (
-                ((d == "CE" and ce_zone_condition) or (d == "PE" and pe_zone_condition)) and
-                ((d == "CE" and ema9 > ema21) or (d == "PE" and ema9 < ema21))
-            ),
-
-            "S6": lambda d: (
-                (d == "CE" and ce_zone_condition) or
-                (d == "PE" and pe_zone_condition)
-            )
-        }
-
-        # ==================================================
-        # OPTION EMA
-        # ==================================================
-        def get_option_ema(option_name):
-            df = self.api_client.fetch_historical_data(option_name, mins="5m", days_back=5)
-            df = TechnicalIndicators.compute_all_indicators(df)
-            last = df.iloc[-1]
-
-            return (
-                round(last.get("EMA_9", 0), 2),
-                round(last.get("EMA_21", 0), 2)
-            )
-
-        def check_option_ema(direction, emaOp9, emaOp21):
-            return emaOp9 > emaOp21 if direction == "CE" else emaOp9 < emaOp21
-
-        def get_token(opt):
-            return opt.get("ScripCode") or opt.get("scripCode") or opt.get("token")
-
-        # ==================================================
-        # STEP 6 ENTRY
-        # ==================================================
-        for sid, cond in strategies.items():
-
-            ce = state["trades"][sid]["CE"]
-
-            if (
-                not ce["active"]
-                and nearest_call
-                and oi_sentiment == "BULLISH"
-                and state["bullish"]
-                and cond("CE")
-                and self.api_client.is_live_entry_time()
-            ):
-
-                if sid in ["S1", "S3", "S4", "S6"]:
-                    emaOp9, emaOp21 = get_option_ema(nearest_call["name"])
-                    if not check_option_ema("CE", emaOp9, emaOp21):
-                        continue
-
-                qty = CONFIG.LOT_SIZES[symbol.upper()] * CONFIG.number_of_lots
-                price = nearest_call["last_price"]
-
-                trade_id = self.db_manager.insert_trade(
-                    symbol=symbol,
-                    strategy=sid,
-                    option_type="CE",
-                    strike=nearest_call["strike_price"],
-                    token=get_token(nearest_call),
-                    qty=qty,
-                    entry_price=price,
-                    entry_oi=oi_sentiment,
-                    entry_delta=delta_bias
-                )
-
-                ce.update({"active": True, "trade_id": trade_id})
-                print(f"✅ {sid} CE ENTRY")
-
-            pe = state["trades"][sid]["PE"]
-
-            if (
-                not pe["active"]
-                and nearest_put
-                and oi_sentiment == "BEARISH"
-                and state["bearish"]
-                and cond("PE")
-                and self.api_client.is_live_entry_time()
-            ):
-
-                if sid in ["S1", "S3", "S4", "S6"]:
-                    emaOp9, emaOp21 = get_option_ema(nearest_put["name"])
-                    if not check_option_ema("PE", emaOp9, emaOp21):
-                        continue
-
-                qty = CONFIG.LOT_SIZES[symbol.upper()] * CONFIG.number_of_lots
-                price = nearest_put["last_price"]
-
-                trade_id = self.db_manager.insert_trade(
-                    symbol=symbol,
-                    strategy=sid,
-                    option_type="PE",
-                    strike=nearest_put["strike_price"],
-                    token=get_token(nearest_put),
-                    qty=qty,
-                    entry_price=price,
-                    entry_oi=oi_sentiment,
-                    entry_delta=delta_bias
-                )
-
-                pe.update({"active": True, "trade_id": trade_id})
-                print(f"✅ {sid} PE ENTRY")
-
-        # ==================================================
-        # STEP 7 EXIT
-        # ==================================================
-        for sid, sides in state["trades"].items():
-
-            for opt_type, trade in sides.items():
-
-                if not trade["active"]:
-                    continue
-
-                exit_now = False
-
-                def get_exit_price(option_type, token, strike):
-                    for opt in option_chain:
-                        if opt.get("option_type") == option_type and (
-                            opt.get("ScripCode") == token or opt.get("strike_price") == strike
-                        ):
-                            return float(opt.get("last_price", 0))
-                    return 0
-
-                exit_price = get_exit_price(opt_type, trade.get("token"), trade.get("strike"))
-
-                emaOp9, emaOp21 = get_option_ema(trade.get("token"))
-
-                # S2 → Index EMA
-                if sid == "S2":
-                    exit_now = ema9 < ema21 if opt_type == "CE" else ema9 > ema21
-
-                # S3 → Option EMA
                 elif sid == "S3":
-                    exit_now = emaOp9 < emaOp21 if opt_type == "CE" else emaOp9 > emaOp21
+                    rev = current_price < vwap if opt_type=="CE" else current_price > vwap
+                    return rev, "SIGNAL_REVERSAL"
 
-                # S1 / S4 → Combined
-                elif sid in ["S1", "S4"]:
-                    if opt_type == "CE":
-                        exit_now = (ema9 < ema21) and (emaOp9 < emaOp21)
-                    else:
-                        exit_now = (ema9 > ema21) and (emaOp9 > emaOp21)
+                elif sid == "S4":
+                    rev = current_price < bb_high if opt_type=="CE" else current_price > bb_low
+                    return rev, "SIGNAL_REVERSAL"
 
-                # S5 → Index EMA
                 elif sid == "S5":
-                    exit_now = ema9 < ema21 if opt_type == "CE" else ema9 > ema21
+                    rev = rsi > 50 if opt_type=="CE" else rsi < 50
+                    return rev, "SIGNAL_REVERSAL"
 
-                # S6 → Option EMA
                 elif sid == "S6":
-                    exit_now = emaOp9 < emaOp21 if opt_type == "CE" else emaOp9 > emaOp21
+                    rev = macd < 0 if opt_type=="CE" else macd > 0
+                    return rev, "SIGNAL_REVERSAL"
 
-                if exit_now or self.api_client.is_force_exit_time():
+                elif sid == "S7":
+                    # Exit if price re-enters ORB range (underlying level check)
+                    tl = trade.get("orb_low")
+                    th = trade.get("orb_high")
+                    if opt_type == "CE":
+                        rev = (tl is not None and current_price < tl)
+                    else:
+                        rev = (th is not None and current_price > th)
+                    return rev, "SIGNAL_REVERSAL"
 
-                    if exit_price <= 0:
+                elif sid == "S8":
+                    # Additional check: underlying price beyond swing level
+                    s8_sl = trade.get("sl_price")   # this is the option premium SL
+                    # We already caught it in the universal check above
+                    return False, ""
+
+                return not strategies[sid](opt_type), "SIGNAL_REVERSAL"
+
+            # ============================================================
+            # FORCE-EXIT NEAR MARKET CLOSE
+            # ============================================================
+            force_exit = self.api_client.is_force_exit_time()
+
+            # ============================================================
+            # ENTRY LOOP
+            # ============================================================
+            for sid, cond in strategies.items():
+                rr_ratio = RR.get(sid, 2.0)
+
+                # ── CE ENTRY ─────────────────────────────────────────
+                if nearest_call:
+                    token = get_token(nearest_call)
+                    if token is not None:
+                        ce = state["trades"][sid]["CE"]
+                        if not ce["active"] and cond("CE"):
+                            entry_price = nearest_call.get("last_price", 0)
+                            qty = CONFIG.LOT_SIZES[symbol.upper()] * CONFIG.number_of_lots
+
+                            # Build strategy-specific extra data
+                            extra_data: Dict = {}
+                            if sid == "S7":
+                                extra_data = {"orb_high": orb_high, "orb_low": orb_low}
+                            elif sid == "S8":
+                                extra_data = {
+                                    "swing_level": s8["ce_swing"],
+                                    "pattern":     s8["ce_pattern"],
+                                    "ce_sl":        s8["ce_sl"],
+                                }
+
+                            # Compute SL and Target
+                            sl_price, target_price = TargetCalculator.compute(
+                                sid, "CE", entry_price, atr,
+                                current_price, extra_data
+                            )
+
+                            trade_id = self.db_manager.insert_trade(
+                                symbol=symbol, strategy=sid, option_type="CE",
+                                strike=nearest_call.get("strike_price"),
+                                token=token, qty=qty, entry_price=entry_price,
+                                entry_oi=oi_sentiment, entry_delta=delta_bias,
+                                orb_high=extra_data.get("orb_high"),
+                                orb_low =extra_data.get("orb_low"),
+                                sl_price=sl_price,
+                                target_price=target_price,
+                                swing_level=extra_data.get("swing_level"),
+                                pattern=extra_data.get("pattern"),
+                            )
+                            ce.update({
+                                "active": True, "trade_id": trade_id,
+                                "token": token, "symbol": nearest_call.get("name"),
+                                "entry_price": entry_price, "qty": qty,
+                                "sl_price": sl_price, "target_price": target_price,
+                                "orb_high": extra_data.get("orb_high"),
+                                "orb_low":  extra_data.get("orb_low"),
+                                "swing_level": extra_data.get("swing_level"),
+                                "pattern":     extra_data.get("pattern"),
+                            })
+                            print(f"  ✅ {sid} CE ENTRY | Strike:{nearest_call.get('strike_price')} "
+                                  f"| Prem:{entry_price:.2f} | SL:{sl_price} | TGT:{target_price} "
+                                  f"| RR:1:{rr_ratio} | RSI:{rsi:.1f}")
+
+                # ── PE ENTRY ─────────────────────────────────────────
+                if nearest_put:
+                    token = get_token(nearest_put)
+                    if token is not None:
+                        pe = state["trades"][sid]["PE"]
+                        if not pe["active"] and cond("PE"):
+                            entry_price = nearest_put.get("last_price", 0)
+                            qty = CONFIG.LOT_SIZES[symbol.upper()] * CONFIG.number_of_lots
+
+                            extra_data = {}
+                            if sid == "S7":
+                                extra_data = {"orb_high": orb_high, "orb_low": orb_low}
+                            elif sid == "S8":
+                                extra_data = {
+                                    "swing_level": s8["pe_swing"],
+                                    "pattern":     s8["pe_pattern"],
+                                    "pe_sl":        s8["pe_sl"],
+                                }
+
+                            sl_price, target_price = TargetCalculator.compute(
+                                sid, "PE", entry_price, atr,
+                                current_price, extra_data
+                            )
+
+                            trade_id = self.db_manager.insert_trade(
+                                symbol=symbol, strategy=sid, option_type="PE",
+                                strike=nearest_put.get("strike_price"),
+                                token=token, qty=qty, entry_price=entry_price,
+                                entry_oi=oi_sentiment, entry_delta=delta_bias,
+                                orb_high=extra_data.get("orb_high"),
+                                orb_low =extra_data.get("orb_low"),
+                                sl_price=sl_price,
+                                target_price=target_price,
+                                swing_level=extra_data.get("swing_level"),
+                                pattern=extra_data.get("pattern"),
+                            )
+                            pe.update({
+                                "active": True, "trade_id": trade_id,
+                                "token": token, "symbol": nearest_put.get("name"),
+                                "entry_price": entry_price, "qty": qty,
+                                "sl_price": sl_price, "target_price": target_price,
+                                "orb_high": extra_data.get("orb_high"),
+                                "orb_low":  extra_data.get("orb_low"),
+                                "swing_level": extra_data.get("swing_level"),
+                                "pattern":     extra_data.get("pattern"),
+                            })
+                            print(f"  ✅ {sid} PE ENTRY | Strike:{nearest_put.get('strike_price')} "
+                                  f"| Prem:{entry_price:.2f} | SL:{sl_price} | TGT:{target_price} "
+                                  f"| RR:1:{rr_ratio} | RSI:{rsi:.1f}")
+
+            # ============================================================
+            # EXIT LOOP
+            # ============================================================
+            for sid, sides in state["trades"].items():
+                for opt_type, trade in sides.items():
+                    if not trade["active"]:
                         continue
 
-                    pnl = (exit_price - trade["entry_price"]) * trade["qty"]
+                    exit_p = get_option_price(opt_type, trade.get("token"), trade.get("strike"))
+                    if exit_p is None or trade.get("entry_price") is None or trade.get("qty") is None:
+                        continue
 
-                    self.db_manager.close_trade(
-                        trade["trade_id"],
-                        exit_price,
-                        pnl
-                    )
+                    pnl = (exit_p - trade["entry_price"]) * trade["qty"]
 
-                    print(f"❌ {sid} EXIT | PnL: {pnl}")
+                    if force_exit:
+                        should_exit, reason = True, "FORCE_CLOSE_EOD"
+                    else:
+                        should_exit, reason = exit_condition(sid, opt_type, trade)
 
-                    trade.update(new_trade_state())
-              
+                    if should_exit:
+                        self.db_manager.close_trade(trade["trade_id"], exit_p, pnl, reason)
+                        sl_p  = trade.get("sl_price")
+                        tgt_p = trade.get("target_price")
+                        print(f"  ❌ {sid} {opt_type} EXIT [{reason}] | "
+                              f"Entry:{trade['entry_price']:.2f} | Exit:{exit_p:.2f} | "
+                              f"SL:{sl_p} | TGT:{tgt_p} | PnL:{pnl:.2f}")
+                        trade.update(new_trade_state())
+
+        except Exception as e:
+            Logger.error(f"display_and_trade error for {symbol}: {e}")
+            import traceback
+            traceback.print_exc()
+
 # ===============================
-# MAIN EXECUTION
+# MAIN
 # ===============================
 
 def main():
-    """Main execution function."""
+    print("\n" + "="*80)
+    print("  PROFESSIONAL TRADING SYSTEM v5.0")
+    print("  S1-Zone | S2-EMA | S3-VWAP | S4-BB | S5-RSI | S6-MACD | S7-ORB | S8-Swing")
+    print("  TARGETS: SL + Target on every strategy (option premium based)")
+    print("="*80)
     try:
-        print("\n" + "="*80)
-        print("PROFESSIONAL TRADING SYSTEM v2.2")
-        print("="*80)
-
-
-
-        # Initialize and run trading system
-        trading_system = SimplifiedTradingSystem()
-        trading_system.run_analysis_loop()
-
-        
+        system = SimplifiedTradingSystem()
+        system.run_analysis_loop()
     except Exception as e:
-        Logger.error(f"System startup error: {e}")
+        Logger.error(f"Startup error: {e}")
         return 1
-    
     return 0
 
 if __name__ == "__main__":
