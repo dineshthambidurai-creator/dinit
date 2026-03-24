@@ -5,44 +5,12 @@ TradeSys v5.0 — Flask Dashboard (TURSO VERSION)
 import os
 from datetime import datetime, date
 from flask import Flask, render_template, jsonify, request
-from turso_db import get_db
+from turso_db import execute_query
 
 app = Flask(__name__)
 
 # ─────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────
-
-def rows_to_list(rows):
-    return [dict(r) for r in rows]
-
-
-def safe_rows(result):
-    try:
-        if result is None:
-            return []
-
-        # Turso normal
-        if hasattr(result, "rows"):
-            return result.rows or []
-
-        # fallback
-        if isinstance(result, list):
-            return result
-
-        # edge case
-        if hasattr(result, "results"):
-            return result.results
-
-        return []
-
-    except Exception as e:
-        print("safe_rows error:", e)
-        return []
-
-
-# ─────────────────────────────────────────
-# ROUTES
+# HOME
 # ─────────────────────────────────────────
 
 @app.route("/")
@@ -50,46 +18,49 @@ def index():
     return render_template("index.html")
 
 
-# ── Trades ───────────────────────────────
+# ─────────────────────────────────────────
+# TRADES
+# ─────────────────────────────────────────
+
 @app.route("/api/trades")
 def api_trades():
     status = request.args.get("status", "ALL").upper()
-    today  = date.today().isoformat()
+    today = date.today().isoformat()
 
     try:
-        db = get_db()
-
         if status == "OPEN":
-            result = db.execute(
+            rows = execute_query(
                 "SELECT * FROM option_trades WHERE status='OPEN' ORDER BY entry_time DESC"
             )
+
         elif status == "CLOSED":
-            result = db.execute(
+            rows = execute_query(
                 "SELECT * FROM option_trades WHERE status='CLOSED' AND date(entry_time)=? ORDER BY exit_time DESC",
                 [today]
             )
+
         else:
-            result = db.execute(
+            rows = execute_query(
                 "SELECT * FROM option_trades ORDER BY entry_time DESC LIMIT 200"
             )
 
-        rows = safe_rows(result)
-        return jsonify(rows_to_list(rows))
+        return jsonify(rows)
 
     except Exception as e:
         print("TRADES ERROR:", e)
         return jsonify({"error": str(e)}), 500
 
 
-# ── Summary ──────────────────────────────
+# ─────────────────────────────────────────
+# SUMMARY
+# ─────────────────────────────────────────
+
 @app.route("/api/summary")
 def api_summary():
     today = date.today().isoformat()
 
     try:
-        db = get_db()
-
-        result = db.execute("""
+        rows = execute_query("""
             SELECT
               COUNT(*) as total_trades,
               SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) as open_trades,
@@ -99,39 +70,36 @@ def api_summary():
             FROM option_trades
         """, [today, today, today])
 
-        rows = safe_rows(result)
-
         if not rows:
             return jsonify({})
 
-        return jsonify(dict(rows[0]))
+        return jsonify(rows[0])
 
     except Exception as e:
         print("SUMMARY ERROR:", e)
         return jsonify({"error": str(e)}), 500
 
 
-# ── Option Chain ─────────────────────────
+# ─────────────────────────────────────────
+# OPTION CHAIN
+# ─────────────────────────────────────────
+
 @app.route("/api/option_chain")
 def api_option_chain():
     symbol = request.args.get("symbol", "NIFTY").upper()
 
     try:
-        db = get_db()
-
-        ts_result = db.execute(
+        ts_rows = execute_query(
             "SELECT MAX(timestamp) as ts FROM option_chain_data WHERE symbol=?",
             [symbol]
         )
-
-        ts_rows = safe_rows(ts_result)
 
         if not ts_rows or not ts_rows[0].get("ts"):
             return jsonify([])
 
         latest_ts = ts_rows[0]["ts"]
 
-        result = db.execute("""
+        rows = execute_query("""
             SELECT strike_price, option_type, last_price, volume,
                    open_interest, change_in_oi, implied_volatility
             FROM option_chain_data
@@ -139,31 +107,29 @@ def api_option_chain():
             ORDER BY strike_price ASC
         """, [symbol, latest_ts])
 
-        rows = safe_rows(result)
-        return jsonify(rows_to_list(rows))
+        return jsonify(rows)
 
     except Exception as e:
         print("OPTION CHAIN ERROR:", e)
         return jsonify({"error": str(e)}), 500
 
 
-# ── Chart Data ───────────────────────────
+# ─────────────────────────────────────────
+# CHART DATA
+# ─────────────────────────────────────────
+
 @app.route("/api/chart")
 def api_chart():
     symbol = request.args.get("symbol", "NIFTY").upper()
 
     try:
-        db = get_db()
-
-        result = db.execute("""
+        rows = execute_query("""
             SELECT timestamp, open_price as open, high, low, close, volume
             FROM market_data
             WHERE symbol=?
             ORDER BY timestamp ASC
             LIMIT 200
         """, [symbol])
-
-        rows = safe_rows(result)
 
         candles = []
 
@@ -172,10 +138,10 @@ def api_chart():
                 ts = datetime.fromisoformat(r["timestamp"])
                 candles.append({
                     "time": int(ts.timestamp()),
-                    "open": float(r["open"] or 0),
-                    "high": float(r["high"] or 0),
-                    "low": float(r["low"] or 0),
-                    "close": float(r["close"] or 0),
+                    "open": float(r.get("open", 0)),
+                    "high": float(r.get("high", 0)),
+                    "low": float(r.get("low", 0)),
+                    "close": float(r.get("close", 0)),
                 })
             except:
                 continue
@@ -187,53 +153,51 @@ def api_chart():
         return jsonify({"error": str(e)}), 500
 
 
-# ── Market Summary ───────────────────────
+# ─────────────────────────────────────────
+# MARKET SUMMARY
+# ─────────────────────────────────────────
+
 @app.route("/api/market_summary")
 def api_market_summary():
     symbol = request.args.get("symbol", "NIFTY").upper()
 
     try:
-        db = get_db()
-
-        result = db.execute("""
+        rows = execute_query("""
             SELECT * FROM market_analysis_summary
             WHERE symbol=?
             ORDER BY timestamp DESC LIMIT 1
         """, [symbol])
 
-        rows = safe_rows(result)
-
         if rows:
-            return jsonify(dict(rows[0]))
+            return jsonify(rows[0])
 
-        fallback = db.execute("""
+        fallback = execute_query("""
             SELECT open_price as open, high, low, close, volume
             FROM market_data
             WHERE symbol=?
             ORDER BY timestamp DESC LIMIT 1
         """, [symbol])
 
-        f_rows = safe_rows(fallback)
-
-        if f_rows:
-            d = dict(f_rows[0])
+        if fallback:
+            d = fallback[0]
             d["current_price"] = d.get("close", 0)
             return jsonify(d)
 
         return jsonify({"current_price": 0})
 
     except Exception as e:
-        print("MARKET SUMMARY ERROR:", e)
+        print("MARKET ERROR:", e)
         return jsonify({"error": str(e)}), 500
 
 
-# ── Strategy Stats ───────────────────────
+# ─────────────────────────────────────────
+# STRATEGY STATS
+# ─────────────────────────────────────────
+
 @app.route("/api/strategy_stats")
 def api_strategy_stats():
     try:
-        db = get_db()
-
-        result = db.execute("""
+        rows = execute_query("""
             SELECT strategy,
               COUNT(*) as total,
               SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) as wins,
@@ -246,15 +210,17 @@ def api_strategy_stats():
             ORDER BY total_pnl DESC
         """)
 
-        rows = safe_rows(result)
-        return jsonify(rows_to_list(rows))
+        return jsonify(rows)
 
     except Exception as e:
         print("STRATEGY ERROR:", e)
         return jsonify({"error": str(e)}), 500
 
 
-# ── Health ───────────────────────────────
+# ─────────────────────────────────────────
+# HEALTH CHECK
+# ─────────────────────────────────────────
+
 @app.route("/api/health")
 def api_health():
     return jsonify({
@@ -264,7 +230,15 @@ def api_health():
     })
 
 
-# ── RUN ─────────────────────────────────
+# ─────────────────────────────────────────
+# RUN
+# ─────────────────────────────────────────
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+
+    print("\n" + "="*50)
+    print("🚀 TradeSys Turso Dashboard Running")
+    print("="*50 + "\n")
+
     app.run(host="0.0.0.0", port=port)
