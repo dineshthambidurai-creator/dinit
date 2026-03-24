@@ -1,3 +1,5 @@
+fastapi
+uvicorn
 py5paisa
 matplotlib
 mplfinance
