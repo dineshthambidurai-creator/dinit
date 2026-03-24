@@ -1,4 +1,3 @@
-gzip
 trendln
 libsql-client
 flask
