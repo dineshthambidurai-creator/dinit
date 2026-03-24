@@ -49,6 +49,8 @@ import pyotp
 import ta
 from py5paisa import FivePaisaClient
 import trendln
+import gzip
+import json
 from scipy.stats import norm
 from turso_db import get_db
 
@@ -462,26 +464,35 @@ class APIClient:
             Logger.error(f"API init failed: {e}")
             return False
 
-    def load_scrips_data(self, file_path="scrips_data.json"):
+  def load_scrips_data(self, file_path="scrips_data.json.gz"):
+  
       if self._scrips_cache is not None:
           return self._scrips_cache
   
       try:
+          if os.path.exists(file_path):
+              Logger.info("Loading scrips from compressed file...")
+  
+              with gzip.open(file_path, "rt") as f:
+                  data = json.load(f)
+  
+              self._scrips_cache = pd.DataFrame(data)
+  
+              Logger.success(f"Scrips loaded: {len(self._scrips_cache)}")
+              return self._scrips_cache
+  
+          # fallback to API
           if not self.client:
-              Logger.error("Client not initialized")
               return None
   
           Logger.info("Fetching scrips from API...")
   
-          scrips_live = self.client.get_scrips()
-          Logger.info(scrips_live)
+          with SuppressPrints():
+              scrips_live = self.client.get_scrips()
   
           if scrips_live is not None and not scrips_live.empty:
               self._scrips_cache = scrips_live
-              Logger.success(f"Scrips loaded: {len(scrips_live)}")
               return scrips_live
-  
-          Logger.error("Empty scrips response")
   
       except Exception as e:
           Logger.error(f"Load scrips failed: {e}")
