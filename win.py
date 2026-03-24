@@ -473,9 +473,8 @@ class APIClient:
   
           Logger.info("Fetching scrips from API...")
   
-          with SuppressPrints():
-              scrips_live = self.client.get_scrips()
-              Logger.info("Fetching scrips from API...")
+          scrips_live = self.client.get_scrips()
+          Logger.info("Fetching scrips from API...")
   
           if scrips_live is not None and not scrips_live.empty:
               self._scrips_cache = scrips_live
