@@ -31,8 +31,6 @@ import os
 import sys
 import time
 import warnings
-import sqlite3
-import threading
 import math
 import re
 from datetime import datetime, timedelta, time as dtime
@@ -48,7 +46,7 @@ import ta
 from py5paisa import FivePaisaClient
 import trendln
 from scipy.stats import norm
-
+from turso_db import get_db
 warnings.filterwarnings('ignore')
 
 # ───────────────────────────────────────────────────────────
@@ -169,392 +167,239 @@ def new_trade_state():
 # ===============================
 
 class DatabaseManager:
-    def __init__(self, db_path: str = None):
-        self.db_path = db_path or CONFIG.DATABASE_PATH
-        self.lock = threading.Lock()
+    def __init__(self):
+        self.db = get_db()
         self._initialize_database()
 
+    # -----------------------------
+    # INIT TABLES
+    # -----------------------------
     def _initialize_database(self):
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                c = conn.cursor()
 
-                c.execute("""CREATE TABLE IF NOT EXISTS option_chain_data (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    symbol TEXT NOT NULL, strike_price REAL NOT NULL,
-                    option_type TEXT NOT NULL, last_price REAL, bid REAL, ask REAL,
-                    volume INTEGER, open_interest INTEGER,
-                    change_in_oi INTEGER, implied_volatility REAL)""")
+        self.db.execute("""
+        CREATE TABLE IF NOT EXISTS option_chain_data (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT,
+            symbol TEXT,
+            strike_price REAL,
+            option_type TEXT,
+            last_price REAL,
+            bid REAL,
+            ask REAL,
+            volume INTEGER,
+            open_interest INTEGER,
+            change_in_oi INTEGER,
+            implied_volatility REAL
+        )
+        """)
 
-                c.execute("""CREATE INDEX IF NOT EXISTS idx_oc_sym_ts
-                    ON option_chain_data(symbol, timestamp, strike_price, option_type)""")
+        self.db.execute("""
+        CREATE TABLE IF NOT EXISTS market_data (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT,
+            symbol TEXT,
+            open_price REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            volume INTEGER
+        )
+        """)
 
-                c.execute("""CREATE TABLE IF NOT EXISTS market_data (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    symbol TEXT NOT NULL, open_price REAL, high REAL,
-                    low REAL, close REAL, volume INTEGER)""")
+        self.db.execute("""
+        CREATE TABLE IF NOT EXISTS option_trades (
+            id INTEGER PRIMARY KEY,
+            symbol TEXT,
+            strategy TEXT,
+            option_type TEXT,
+            strike REAL,
+            token TEXT,
+            qty INTEGER,
+            entry_price REAL,
+            current_price REAL,
+            exit_price REAL,
+            pnl REAL,
+            status TEXT,
+            entry_oi TEXT,
+            entry_delta REAL,
+            orb_high REAL,
+            orb_low REAL,
+            sl_price REAL,
+            target_price REAL,
+            swing_level REAL,
+            pattern TEXT,
+            exit_reason TEXT,
+            entry_time TEXT,
+            exit_time TEXT
+        )
+        """)
 
-                c.execute("""CREATE INDEX IF NOT EXISTS idx_md_sym_ts
-                    ON market_data(symbol, timestamp)""")
+        self.db.execute("""
+        CREATE TABLE IF NOT EXISTS market_analysis_summary (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT,
+            symbol TEXT,
+            current_price REAL,
+            market_open REAL,
+            market_high REAL,
+            market_low REAL,
+            market_volume INTEGER,
+            market_bias TEXT,
+            nearest_call_strike REAL,
+            nearest_call_last REAL,
+            nearest_put_strike REAL,
+            nearest_put_last REAL
+        )
+        """)
 
-                # option_trades — now includes target_price
-                c.execute("""CREATE TABLE IF NOT EXISTS option_trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL, strategy TEXT, option_type TEXT,
-                    strike REAL, token TEXT, qty INTEGER,
-                    entry_price REAL, current_price REAL, exit_price REAL, pnl REAL,
-                    status TEXT, entry_oi TEXT, entry_delta REAL,
-                    orb_high REAL, orb_low REAL,
-                    sl_price REAL, target_price REAL,
-                    swing_level REAL, pattern TEXT,
-                    exit_reason TEXT,
-                    entry_time DATETIME DEFAULT CURRENT_TIMESTAMP, exit_time DATETIME)""")
-
-                c.execute("""CREATE INDEX IF NOT EXISTS idx_ot_sym_status
-                    ON option_trades(symbol, status)""")
-                c.execute("""CREATE INDEX IF NOT EXISTS idx_ot_strategy
-                    ON option_trades(strategy)""")
-                c.execute("""CREATE INDEX IF NOT EXISTS idx_ot_entry_time
-                    ON option_trades(entry_time)""")
-
-                c.execute("""CREATE TABLE IF NOT EXISTS sentiment_option_trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    symbol TEXT NOT NULL,
-                    sentiment_type TEXT, direction TEXT, strike REAL, token TEXT,
-                    entry_price REAL, exit_price REAL, current_index_price REAL,
-                    market_open REAL, market_high REAL, market_low REAL, market_volume REAL,
-                    call_volume REAL, put_volume REAL, call_oi REAL, put_oi REAL,
-                    call_oi_change REAL, put_oi_change REAL,
-                    pcr_oi REAL, pcr_oi_change REAL, pcr_volume REAL, pcr_vol_price REAL,
-                    oi_sentiment TEXT, oi_change_sentiment TEXT,
-                    volume_sentiment TEXT, combined_sentiment TEXT,
-                    avg_iv REAL, iv_rank REAL, iv_percentile REAL,
-                    gamma_flip_level REAL, delta_bias_score REAL,
-                    sl_points REAL, target_points REAL, trade_signal TEXT)""")
-
-                c.execute("""CREATE INDEX IF NOT EXISTS idx_sot_sym_ts
-                    ON sentiment_option_trades(symbol, timestamp)""")
-
-                c.execute("""CREATE TABLE IF NOT EXISTS delta_oi_trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    symbol TEXT NOT NULL,
-                    trade_side TEXT, oi_sentiment TEXT,
-                    entry_price REAL, current_price REAL, exit_price REAL,
-                    pcr_oi REAL, delta_bias_score REAL, gamma_flip_level REAL,
-                    status TEXT)""")
-
-                c.execute("""CREATE INDEX IF NOT EXISTS idx_dot_sym_ts
-                    ON delta_oi_trades(symbol, timestamp)""")
-
-                c.execute("""CREATE TABLE IF NOT EXISTS market_analysis_summary (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    symbol TEXT NOT NULL, current_price REAL,
-                    market_open REAL, market_high REAL, market_low REAL, market_volume INTEGER,
-                    market_bias TEXT, nearest_call_strike REAL, nearest_call_last REAL,
-                    nearest_put_strike REAL, nearest_put_last REAL)""")
-
-                c.execute("""CREATE INDEX IF NOT EXISTS idx_mas_sym_ts
-                    ON market_analysis_summary(symbol, timestamp)""")
-
-                conn.commit()
-        except Exception as e:
-            Logger.error(f"DB init failed: {e}")
-            raise
-
-        self._migrate_database()
-
-    def _migrate_database(self):
-        """Safe migration — adds missing columns without touching existing data."""
-        migrations = [
-            ("option_trades", "orb_high",      "REAL"),
-            ("option_trades", "orb_low",       "REAL"),
-            ("option_trades", "sl_price",      "REAL"),
-            ("option_trades", "target_price",  "REAL"),   # NEW v5
-            ("option_trades", "swing_level",   "REAL"),
-            ("option_trades", "pattern",       "TEXT"),
-            ("option_trades", "exit_reason",   "TEXT"),   # NEW v5
-            ("option_trades", "current_price", "REAL"),
-            ("option_trades", "exit_price",    "REAL"),
-            ("option_trades", "pnl",           "REAL"),
-            ("option_trades", "exit_time",     "DATETIME"),
-            ("sentiment_option_trades", "avg_iv",           "REAL"),
-            ("sentiment_option_trades", "iv_rank",          "REAL"),
-            ("sentiment_option_trades", "iv_percentile",    "REAL"),
-            ("sentiment_option_trades", "gamma_flip_level", "REAL"),
-            ("sentiment_option_trades", "delta_bias_score", "REAL"),
-            ("sentiment_option_trades", "sl_points",        "REAL"),
-            ("sentiment_option_trades", "target_points",    "REAL"),
-            ("sentiment_option_trades", "trade_signal",     "TEXT"),
-        ]
-        with self.lock:
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    c = conn.cursor()
-                    for table, col, coltype in migrations:
-                        try:
-                            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
-                            Logger.info(f"DB migration: added {table}.{col}")
-                        except sqlite3.OperationalError:
-                            pass
-                    conn.commit()
-            except Exception as e:
-                Logger.error(f"DB migration failed: {e}")
-
+    # -----------------------------
+    # STORE OPTION CHAIN
+    # -----------------------------
     def store_option_chain_data(self, symbol, option_chain_data):
-        if not option_chain_data:
-            return
-        with self.lock:
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    c = conn.cursor()
-                    ts = datetime.now()
-                    for opt in option_chain_data:
-                        c.execute("""INSERT INTO option_chain_data (
-                            timestamp, symbol, strike_price, option_type,
-                            last_price, bid, ask, volume, open_interest,
-                            change_in_oi, implied_volatility)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                            (ts, symbol,
-                             opt.get('strike_price', 0), opt.get('option_type', ''),
-                             opt.get('last_price', 0), opt.get('bid', 0), opt.get('ask', 0),
-                             opt.get('volume', 0), opt.get('open_interest', 0),
-                             opt.get('change_in_oi', 0), opt.get('implied_volatility', 0)))
-                    conn.commit()
-            except Exception as e:
-                Logger.error(f"Store option chain failed: {e}")
 
+        queries = []
+
+        for opt in option_chain_data:
+            queries.append((
+                """INSERT INTO option_chain_data
+                (timestamp, symbol, strike_price, option_type,
+                 last_price, bid, ask, volume, open_interest,
+                 change_in_oi, implied_volatility)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    datetime.now().isoformat(),
+                    symbol,
+                    opt.get('strike_price', 0),
+                    opt.get('option_type', ''),
+                    opt.get('last_price', 0),
+                    opt.get('bid', 0),
+                    opt.get('ask', 0),
+                    opt.get('volume', 0),
+                    opt.get('open_interest', 0),
+                    opt.get('change_in_oi', 0),
+                    opt.get('implied_volatility', 0)
+                ]
+            ))
+
+        if queries:
+            self.db.batch(queries)
+
+    # -----------------------------
+    # STORE MARKET DATA
+    # -----------------------------
     def store_market_data(self, symbol, market_data):
-        with self.lock:
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.execute("""INSERT INTO market_data
-                        (timestamp, symbol, open_price, high, low, close, volume)
-                        VALUES (?,?,?,?,?,?,?)""",
-                        (datetime.now(), symbol,
-                         market_data.get('open', 0), market_data.get('high', 0),
-                         market_data.get('low', 0), market_data.get('close', 0),
-                         market_data.get('volume', 0)))
-                    conn.commit()
-            except Exception as e:
-                Logger.error(f"Store market data failed: {e}")
 
+        self.db.execute("""
+        INSERT INTO market_data
+        (timestamp, symbol, open_price, high, low, close, volume)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, [
+            datetime.now().isoformat(),
+            symbol,
+            market_data.get('open', 0),
+            market_data.get('high', 0),
+            market_data.get('low', 0),
+            market_data.get('close', 0),
+            market_data.get('volume', 0)
+        ])
+
+    # -----------------------------
+    # INSERT TRADE
+    # -----------------------------
     def insert_trade(self, **data):
-        with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
-                c = conn.cursor()
-                c.execute("""INSERT INTO option_trades (
-                    symbol, strategy, option_type, strike, token,
-                    qty, entry_price, status, entry_oi, entry_delta,
-                    orb_high, orb_low,
-                    sl_price, target_price,
-                    swing_level, pattern,
-                    entry_time)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (data["symbol"], data["strategy"], data["option_type"],
-                     data["strike"], data["token"],
-                     data["qty"], data["entry_price"],
-                     "OPEN", data["entry_oi"], data["entry_delta"],
-                     data.get("orb_high"), data.get("orb_low"),
-                     data.get("sl_price"), data.get("target_price"),
-                     data.get("swing_level"), data.get("pattern"),
-                     datetime.now().isoformat()))
-                return c.lastrowid
 
+        result = self.db.execute("""
+        INSERT INTO option_trades (
+            symbol, strategy, option_type, strike, token,
+            qty, entry_price, status, entry_oi, entry_delta,
+            orb_high, orb_low,
+            sl_price, target_price,
+            swing_level, pattern,
+            entry_time
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            data["symbol"],
+            data["strategy"],
+            data["option_type"],
+            data["strike"],
+            data["token"],
+            data["qty"],
+            data["entry_price"],
+            data["entry_oi"],
+            data["entry_delta"],
+            data.get("orb_high"),
+            data.get("orb_low"),
+            data.get("sl_price"),
+            data.get("target_price"),
+            data.get("swing_level"),
+            data.get("pattern"),
+            datetime.now().isoformat()
+        ])
+
+        return result.last_insert_rowid
+
+    # -----------------------------
+    # CLOSE TRADE
+    # -----------------------------
     def close_trade(self, trade_id, exit_price, pnl, exit_reason="SIGNAL_EXIT"):
-        with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""UPDATE option_trades SET
-                    exit_price=?, pnl=?, status='CLOSED',
-                    exit_reason=?, exit_time=?
-                    WHERE id=?""",
-                    (exit_price, pnl, exit_reason,
-                     datetime.now().isoformat(), trade_id))
 
-    def restore_open_trades(self) -> Dict[str, Any]:
-        """
-        On startup, reload every OPEN trade from the DB and rebuild
-        CONFIG.oi_state so the system continues monitoring / exiting them.
+        self.db.execute("""
+        UPDATE option_trades
+        SET exit_price=?, pnl=?, status='CLOSED',
+            exit_reason=?, exit_time=?
+        WHERE id=?
+        """, [
+            exit_price,
+            pnl,
+            exit_reason,
+            datetime.now().isoformat(),
+            trade_id
+        ])
 
-        Returns a summary dict  {symbol: {"CE": count, "PE": count}}
-        """
-        ALL_STRATEGIES = ["S1","S2","S3","S4","S5","S6","S7","S8"]
+    # -----------------------------
+    # RESTORE OPEN TRADES
+    # -----------------------------
+    def restore_open_trades(self):
 
-        with self.lock:
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.row_factory = sqlite3.Row
-                    rows = conn.execute(
-                        "SELECT * FROM option_trades WHERE status='OPEN' ORDER BY entry_time ASC"
-                    ).fetchall()
-            except Exception as e:
-                Logger.error(f"restore_open_trades DB read failed: {e}")
-                return {}
+        result = self.db.execute(
+            "SELECT * FROM option_trades WHERE status='OPEN'"
+        )
 
-        summary: Dict[str, Any] = {}
+        rows = result.rows
 
-        for row in rows:
-            symbol   = row["symbol"]
-            strategy = row["strategy"]
-            opt_type = row["option_type"]  # "CE" or "PE"
+        Logger.info(f"Restored {len(rows)} open trades")
 
-            if not symbol or not strategy or not opt_type:
-                continue
-            if strategy not in ALL_STRATEGIES:
-                continue
+        return rows
 
-            # ── Ensure CONFIG.oi_state structure exists ──────────────────
-            if symbol not in CONFIG.oi_state:
-                CONFIG.oi_state[symbol] = {
-                    "bullish": False, "bearish": False,
-                    "trades": {s: {"CE": new_trade_state(), "PE": new_trade_state()}
-                               for s in ALL_STRATEGIES}
-                }
-            for s in ALL_STRATEGIES:
-                if s not in CONFIG.oi_state[symbol]["trades"]:
-                    CONFIG.oi_state[symbol]["trades"][s] = {
-                        "CE": new_trade_state(), "PE": new_trade_state()
-                    }
-
-            trade_state = CONFIG.oi_state[symbol]["trades"][strategy][opt_type]
-
-            # ── Only restore if no active trade already in memory ─────────
-            if trade_state["active"]:
-                Logger.warning(
-                    f"[RESTORE] {symbol} {strategy} {opt_type} already active in memory — skipping"
-                )
-                continue
-
-            # ── Rebuild trade state from DB row ──────────────────────────
-            trade_state.update({
-                "active":       True,
-                "trade_id":     row["id"],
-                "strike":       row["strike"],
-                "token":        row["token"],
-                "symbol":       row["symbol"],
-                "entry_price":  row["entry_price"],
-                "qty":          row["qty"],
-                "entry_oi":     row["entry_oi"],
-                "entry_delta":  row["entry_delta"],
-                "sl_price":     row["sl_price"],
-                "target_price": row["target_price"],
-                "orb_high":     row["orb_high"],
-                "orb_low":      row["orb_low"],
-                "swing_level":  row["swing_level"],
-                "pattern":      row["pattern"],
-            })
-
-            # ── Summary ──────────────────────────────────────────────────
-            sym_summary = summary.setdefault(symbol, {})
-            key = f"{strategy}_{opt_type}"
-            sym_summary[key] = {
-                "trade_id":    row["id"],
-                "strike":      row["strike"],
-                "entry_price": row["entry_price"],
-                "sl_price":    row["sl_price"],
-                "target_price":row["target_price"],
-                "entry_time":  row["entry_time"],
-            }
-
-            Logger.info(
-                f"[RESTORE] ✅ {symbol} {strategy} {opt_type} "
-                f"| Strike:{row['strike']} | Entry:₹{row['entry_price']} "
-                f"| SL:₹{row['sl_price']} | TGT:₹{row['target_price']} "
-                f"| ID:{row['id']}"
-            )
-
-        total = sum(len(v) for v in summary.values())
-        if total:
-            Logger.success(f"[RESTORE] Restored {total} open trade(s) across {len(summary)} symbol(s)")
-        else:
-            Logger.info("[RESTORE] No open trades found in DB — starting fresh")
-
-        return summary
-
+    # -----------------------------
+    # MARKET SUMMARY
+    # -----------------------------
     def store_market_analysis_summary(self, symbol, current_price, current_data,
-                                       market_bias, nearest_call, nearest_put):
-        with self.lock:
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.execute("""INSERT INTO market_analysis_summary (
-                        timestamp, symbol, current_price,
-                        market_open, market_high, market_low, market_volume, market_bias,
-                        nearest_call_strike, nearest_call_last,
-                        nearest_put_strike, nearest_put_last)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (datetime.now(), symbol, current_price,
-                         current_data.get('open', 0), current_data.get('high', 0),
-                         current_data.get('low', 0), current_data.get('volume', 0), market_bias,
-                         nearest_call.get('strike_price', 0) if nearest_call else None,
-                         nearest_call.get('last_price', 0)   if nearest_call else None,
-                         nearest_put.get('strike_price', 0)  if nearest_put  else None,
-                         nearest_put.get('last_price', 0)    if nearest_put  else None))
-                    conn.commit()
-            except Exception as e:
-                Logger.error(f"store_market_analysis_summary failed: {e}")
+                                      market_bias, nearest_call, nearest_put):
 
-    def store_sentiment_trade(self, symbol, sentiment_type, direction, strike, token,
-                               entry_price, exit_price, current_index_price,
-                               current_data, option_analysis):
-        with self.lock:
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.execute("""INSERT INTO sentiment_option_trades (
-                        timestamp, symbol, sentiment_type, direction, strike, token,
-                        entry_price, exit_price, current_index_price,
-                        market_open, market_high, market_low, market_volume,
-                        call_volume, put_volume, call_oi, put_oi,
-                        call_oi_change, put_oi_change,
-                        pcr_oi, pcr_oi_change, pcr_volume, pcr_vol_price,
-                        oi_sentiment, oi_change_sentiment, volume_sentiment, combined_sentiment,
-                        avg_iv, iv_rank, iv_percentile,
-                        gamma_flip_level, delta_bias_score,
-                        sl_points, target_points, trade_signal)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (datetime.now(), symbol, sentiment_type, direction, strike, token,
-                         entry_price, exit_price, current_index_price,
-                         current_data.get('open', 0), current_data.get('high', 0),
-                         current_data.get('low', 0), current_data.get('volume', 0),
-                         option_analysis.get('call_volume', 0), option_analysis.get('put_volume', 0),
-                         option_analysis.get('call_oi', 0), option_analysis.get('put_oi', 0),
-                         option_analysis.get('call_oi_change', 0), option_analysis.get('put_oi_change', 0),
-                         option_analysis.get('pcr_oi', 0), option_analysis.get('pcr_oi_change', 0),
-                         option_analysis.get('pcr_volume', 0), option_analysis.get('pcr_vol_price', 0),
-                         option_analysis.get('oi_sentiment', 'N/A'),
-                         option_analysis.get('oi_change_sentiment', 'N/A'),
-                         option_analysis.get('volume_sentiment', 'N/A'),
-                         option_analysis.get('sentiment', 'N/A'),
-                         option_analysis.get('avg_iv', 0), option_analysis.get('iv_rank', 0),
-                         option_analysis.get('iv_percentile', 0),
-                         option_analysis.get('gamma_flip_level', 0),
-                         option_analysis.get('delta_bias_score', 0),
-                         option_analysis.get('sl_points', 0), option_analysis.get('target_points', 0),
-                         option_analysis.get('trade_signal', None)))
-                    conn.commit()
-            except Exception as e:
-                Logger.error(f"store_sentiment_trade failed: {e}")
-
-    def store_delta_oi_trade(self, symbol, trade_side, oi_sentiment,
-                              entry_price, current_price, exit_price,
-                              pcr_oi, delta_bias_score, gamma_flip_level, status):
-        with self.lock:
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.execute("""INSERT INTO delta_oi_trades (
-                        symbol, trade_side, oi_sentiment,
-                        entry_price, current_price, exit_price,
-                        pcr_oi, delta_bias_score, gamma_flip_level, status)
-                        VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                        (symbol, trade_side, oi_sentiment, entry_price, current_price,
-                         exit_price, pcr_oi, delta_bias_score, gamma_flip_level, status))
-                    conn.commit()
-            except Exception as e:
-                Logger.error(f"store_delta_oi_trade failed: {e}")
-
+        self.db.execute("""
+        INSERT INTO market_analysis_summary (
+            timestamp, symbol, current_price,
+            market_open, market_high, market_low, market_volume, market_bias,
+            nearest_call_strike, nearest_call_last,
+            nearest_put_strike, nearest_put_last
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            datetime.now().isoformat(),
+            symbol,
+            current_price,
+            current_data.get('open', 0),
+            current_data.get('high', 0),
+            current_data.get('low', 0),
+            current_data.get('volume', 0),
+            market_bias,
+            nearest_call.get('strike_price', 0) if nearest_call else None,
+            nearest_call.get('last_price', 0) if nearest_call else None,
+            nearest_put.get('strike_price', 0) if nearest_put else None,
+            nearest_put.get('last_price', 0) if nearest_put else None
+        ])
 # ===============================
 # API CLIENT
 # ===============================
