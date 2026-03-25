@@ -371,7 +371,7 @@ footer{padding:8px 24px;border-top:1px solid var(--border);display:flex;justify-
 </div>
 
 <footer>
-  <span>TradeSys v5.0 · S1–S8 · SQLite · Auto-refresh 15s · Multi-select Filters</span>
+  <span>TradeSys v5.0 · S1–S8 · Turso DB · Auto-refresh 15s · Multi-select Filters</span>
   <span id="last-upd">—</span>
 </footer>
 
@@ -745,7 +745,14 @@ async function fetchAll(){
   try{
     const tRes=await fetch('/api/trades');
     if(tRes.ok){
-      allTrades=await tRes.json();
+      const tData=await tRes.json();
+      // ✅ Guard: API may return {error: "..."} instead of array when DB fails
+      if(Array.isArray(tData)){
+        allTrades=tData;
+      } else {
+        console.warn('Trades API returned non-array:', tData);
+        allTrades=[];
+      }
       renderAll();
     }
     const activeSyms=[...new Set(allTrades.filter(t=>t.status==='OPEN').map(t=>t.symbol))];
@@ -753,7 +760,10 @@ async function fetchAll(){
     document.getElementById('oc-sym').textContent=ocSymbol;
     const oRes=await fetch(`/api/option_chain?symbol=${ocSymbol}`);
     const mRes=await fetch(`/api/market_summary?symbol=${ocSymbol}`);
-    if(oRes.ok)ocData=await oRes.json();
+    if(oRes.ok){
+      const oData=await oRes.json();
+      ocData=Array.isArray(oData)?oData:[];
+    }
     let atm=0;
     if(mRes.ok){const ms=await mRes.json();atm=+ms.current_price||0;}
     renderOC(atm);
