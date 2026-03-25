@@ -26,10 +26,6 @@ TARGET LOGIC (per strategy, added in v5):
     S8: 1:2.0  (Swing/Trendline - structure)
 """
 import asyncio
-
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
 import json
 import os
 import sys
@@ -50,7 +46,7 @@ import ta
 from py5paisa import FivePaisaClient
 import trendln
 from scipy.stats import norm
-from turso_db import get_db
+from turso_db import get_db, execute_write, execute_batch, _rows_to_dicts
 
   
 warnings.filterwarnings('ignore')
@@ -183,7 +179,7 @@ class DatabaseManager:
     # -----------------------------
     def _initialize_database(self):
 
-        self.db.execute("""
+        execute_write("""
         CREATE TABLE IF NOT EXISTS option_chain_data (
             id INTEGER PRIMARY KEY,
             timestamp TEXT,
@@ -200,7 +196,7 @@ class DatabaseManager:
         )
         """)
 
-        self.db.execute("""
+        execute_write("""
         CREATE TABLE IF NOT EXISTS market_data (
             id INTEGER PRIMARY KEY,
             timestamp TEXT,
@@ -213,7 +209,7 @@ class DatabaseManager:
         )
         """)
 
-        self.db.execute("""
+        execute_write("""
         CREATE TABLE IF NOT EXISTS option_trades (
             id INTEGER PRIMARY KEY,
             symbol TEXT,
@@ -241,7 +237,7 @@ class DatabaseManager:
         )
         """)
 
-        self.db.execute("""
+        execute_write("""
         CREATE TABLE IF NOT EXISTS market_analysis_summary (
             id INTEGER PRIMARY KEY,
             timestamp TEXT,
@@ -289,14 +285,14 @@ class DatabaseManager:
             ))
 
         if queries:
-            self.db.batch(queries)
+            execute_batch(queries)
 
     # -----------------------------
     # STORE MARKET DATA
     # -----------------------------
     def store_market_data(self, symbol, market_data):
 
-        self.db.execute("""
+        execute_write("""
         INSERT INTO market_data
         (timestamp, symbol, open_price, high, low, close, volume)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -315,7 +311,7 @@ class DatabaseManager:
     # -----------------------------
     def insert_trade(self, **data):
 
-        result = self.db.execute("""
+        result = execute_write("""
         INSERT INTO option_trades (
             symbol, strategy, option_type, strike, token,
             qty, entry_price, status, entry_oi, entry_delta,
@@ -344,14 +340,21 @@ class DatabaseManager:
             datetime.now().isoformat()
         ])
 
-        return result.last_insert_rowid
+        # last_insert_rowid is a property (not a method) in libsql_client
+        if result is not None:
+            rowid = result.last_insert_rowid
+            # Some versions return it as a callable
+            if callable(rowid):
+                rowid = rowid()
+            return rowid
+        return None
 
     # -----------------------------
     # CLOSE TRADE
     # -----------------------------
     def close_trade(self, trade_id, exit_price, pnl, exit_reason="SIGNAL_EXIT"):
 
-        self.db.execute("""
+        execute_write("""
         UPDATE option_trades
         SET exit_price=?, pnl=?, status='CLOSED',
             exit_reason=?, exit_time=?
@@ -373,7 +376,8 @@ class DatabaseManager:
             "SELECT * FROM option_trades WHERE status='OPEN'"
         )
 
-        rows = result.rows
+        # ✅ Convert raw rows → list of dicts using column names
+        rows = _rows_to_dicts(result)
 
         Logger.info(f"Restored {len(rows)} open trades")
 
@@ -385,7 +389,7 @@ class DatabaseManager:
     def store_market_analysis_summary(self, symbol, current_price, current_data,
                                       market_bias, nearest_call, nearest_put):
 
-        self.db.execute("""
+        execute_write("""
         INSERT INTO market_analysis_summary (
             timestamp, symbol, current_price,
             market_open, market_high, market_low, market_volume, market_bias,
@@ -1902,9 +1906,7 @@ class SimplifiedTradingSystem:
 # MAIN (FIXED)
 # ===============================
 
-import asyncio
-
-async def main():
+def main():
     print("\n" + "="*80)
     print("  PROFESSIONAL TRADING SYSTEM v5.0")
     print("  S1-Zone | S2-EMA | S3-VWAP | S4-BB | S5-RSI | S6-MACD | S7-ORB | S8-Swing")
@@ -1913,11 +1915,13 @@ async def main():
 
     try:
         system = SimplifiedTradingSystem()
-        system.run_analysis_loop()   # your existing loop
+        system.run_analysis_loop()
     except Exception as e:
         Logger.error(f"Startup error: {e}")
-        await asyncio.sleep(5)  # prevent crash loop
+        import traceback
+        traceback.print_exc()
+        time.sleep(5)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
