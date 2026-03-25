@@ -19,31 +19,31 @@ def index():
 
 
 # ─────────────────────────────────────────
-# TRADES
+# TRADES  — fetch ALL trades, no today restriction
 # ─────────────────────────────────────────
 
 @app.route("/api/trades")
 def api_trades():
-    status = request.args.get("status", "ALL").upper()
-    today = date.today().isoformat()
+    status    = request.args.get("status", "ALL").upper()
+    date_str  = request.args.get("date", "")        # optional YYYY-MM-DD filter
+    limit     = int(request.args.get("limit", 500)) # default 500
 
     try:
-        if status == "OPEN":
-            rows = execute_query(
-                "SELECT * FROM option_trades WHERE status='OPEN' ORDER BY entry_time DESC"
-            )
+        where_parts = []
+        params      = []
 
-        elif status == "CLOSED":
-            rows = execute_query(
-                "SELECT * FROM option_trades WHERE status='CLOSED' AND date(entry_time)=? ORDER BY exit_time DESC",
-                [today]
-            )
+        if status in ("OPEN", "CLOSED"):
+            where_parts.append("status=?")
+            params.append(status)
 
-        else:
-            rows = execute_query(
-                "SELECT * FROM option_trades ORDER BY entry_time DESC LIMIT 200"
-            )
+        if date_str:
+            where_parts.append("date(entry_time)=?")
+            params.append(date_str)
 
+        where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        sql   = f"SELECT * FROM option_trades {where} ORDER BY entry_time DESC LIMIT {limit}"
+
+        rows = execute_query(sql, params)
         return jsonify(rows)
 
     except Exception as e:
@@ -132,18 +132,17 @@ def api_chart():
         """, [symbol])
 
         candles = []
-
         for r in rows:
             try:
                 ts = datetime.fromisoformat(r["timestamp"])
                 candles.append({
-                    "time": int(ts.timestamp()),
-                    "open": float(r.get("open", 0)),
-                    "high": float(r.get("high", 0)),
-                    "low": float(r.get("low", 0)),
+                    "time":  int(ts.timestamp()),
+                    "open":  float(r.get("open",  0)),
+                    "high":  float(r.get("high",  0)),
+                    "low":   float(r.get("low",   0)),
                     "close": float(r.get("close", 0)),
                 })
-            except:
+            except Exception:
                 continue
 
         return jsonify(candles)
@@ -225,8 +224,8 @@ def api_strategy_stats():
 def api_health():
     return jsonify({
         "status": "ok",
-        "db": "Turso",
-        "time": datetime.now().isoformat()
+        "db":     "Turso",
+        "time":   datetime.now().isoformat()
     })
 
 
@@ -236,9 +235,7 @@ def api_health():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-
     print("\n" + "="*50)
     print("🚀 TradeSys Turso Dashboard Running")
     print("="*50 + "\n")
-
     app.run(host="0.0.0.0", port=port)
